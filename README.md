@@ -13,8 +13,26 @@ A starter Telegram bot project built with [`python-telegram-bot`](https://python
 - Echo replies for normal text messages
 - Fallback handler for unknown commands
 - Error logging
-- Bot token loaded from a local `.env` file or Railway variables
+- **PostgreSQL persistence** (asyncpg): users are stored/updated on `/start`
+- **Redis integration**: per-user message counter and a short-lived `/ping` cache
+- Configuration loaded from a local `.env` file or Railway variables
 - Ready to run with Docker and Railway
+
+## Data Stores
+
+PostgreSQL and Redis are **optional**. When `DATABASE_URL` / `REDIS_URL` are set the bot
+connects on startup; when they are missing, empty, or unreachable it logs a warning and keeps
+running with that backend disabled. This makes local testing easy, while Railway just links
+the services automatically.
+
+- **PostgreSQL** — a `users` table is created automatically on first run. `/start` inserts
+  a new user or refreshes `username`, `first_name`, and `last_seen` for an existing one.
+  Without a database, `/start` still greets the user but nothing is persisted.
+- **Redis** — `/ping` reports whether the reply came from a 10-second cache (`fresh` vs
+  `cached`), and each echoed text message increments a per-user counter. Without Redis,
+  `/ping` replies with a plain `pong` and the counter falls back to in-memory (per-process).
+
+Connections are pooled (asyncpg) and reused across updates, then closed cleanly on shutdown.
 
 ## Chat Menu Buttons
 
@@ -44,7 +62,9 @@ Telegram bots cannot display custom buttons before a user starts or messages the
 .
 ├── bot/
 │   ├── __init__.py
+│   ├── cache.py        # Redis client and helpers
 │   ├── config.py
+│   ├── db.py           # PostgreSQL pool and queries
 │   ├── handlers.py
 │   └── main.py
 ├── .env
@@ -66,10 +86,27 @@ Telegram bots cannot display custom buttons before a user starts or messages the
 
 ## Environment Variables
 
-| Name        | Required | Default | Description                                        |
-| ----------- | -------- | ------- | -------------------------------------------------- |
-| `BOT_TOKEN` | Yes      | -       | Bot token from `@BotFather`                        |
-| `LOG_LEVEL` | No       | `INFO`  | Logging level, such as `DEBUG`, `INFO`, or `ERROR` |
+| Name           | Required | Default | Description                                        |
+| -------------- | -------- | ------- | -------------------------------------------------- |
+| `BOT_TOKEN`    | Yes      | -       | Bot token from `@BotFather`                        |
+| `DATABASE_URL` | No       | -       | PostgreSQL connection string; omit to run without persistence |
+| `REDIS_URL`    | No       | -       | Redis connection string; omit to run without caching          |
+| `LOG_LEVEL`    | No       | `INFO`  | Logging level, such as `DEBUG`, `INFO`, or `ERROR` |
+
+On Railway, add the **PostgreSQL** and **Redis** plugins to your project and reference their
+connection strings from the bot service:
+
+```text
+DATABASE_URL=${{ Postgres.DATABASE_URL }}
+REDIS_URL=${{ Redis.REDIS_URL }}
+```
+
+For local development you can run both with Docker:
+
+```bash
+docker run -d --name pg  -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
+docker run -d --name red -p 6379:6379 redis:7
+```
 
 ## Install and Run Locally
 

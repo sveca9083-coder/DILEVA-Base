@@ -5,8 +5,15 @@ import logging
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder
 
+from bot import cache, db
 from bot.config import Settings
-from bot.handlers import error_handler, register_handlers, set_bot_commands
+from bot.handlers import (
+    DB_KEY,
+    REDIS_KEY,
+    error_handler,
+    register_handlers,
+    set_bot_commands,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -20,11 +27,48 @@ def configure_logging(level_name: str) -> None:
     )
 
 
+async def _connect_optional(name, url, connect):
+    """Connect to an optional backend, returning None when unavailable.
+
+    Missing/empty URL -> skipped with a warning. Connection failure -> logged as
+    an error but the bot keeps running without that backend.
+    """
+    if not url:
+        logger.warning("%s URL not set - running without it.", name)
+        return None
+    try:
+        return await connect(url)
+    except Exception:
+        logger.exception("%s unavailable - running without it.", name)
+        return None
+
+
 def build_application(settings: Settings) -> Application:
+    async def on_startup(application: Application) -> None:
+        # Optional backends: the bot runs even when DATABASE_URL / REDIS_URL are
+        # missing or unreachable, degrading gracefully instead of refusing to start.
+        application.bot_data[DB_KEY] = await _connect_optional(
+            "PostgreSQL", settings.database_url, db.create_pool
+        )
+        application.bot_data[REDIS_KEY] = await _connect_optional(
+            "Redis", settings.redis_url, cache.create_client
+        )
+        await set_bot_commands(application)
+
+    async def on_shutdown(application: Application) -> None:
+        pool = application.bot_data.get(DB_KEY)
+        if pool is not None:
+            await db.close_pool(pool)
+
+        client = application.bot_data.get(REDIS_KEY)
+        if client is not None:
+            await cache.close_client(client)
+
     application = (
         ApplicationBuilder()
         .token(settings.bot_token)
-        .post_init(set_bot_commands)
+        .post_init(on_startup)
+        .post_shutdown(on_shutdown)
         .build()
     )
     register_handlers(application)

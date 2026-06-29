@@ -3,10 +3,21 @@
 import logging
 
 from telegram import ReplyKeyboardMarkup, Update
+from telegram.error import Conflict, NetworkError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+from bot import cache, db
 
 
 logger = logging.getLogger(__name__)
+
+# Keys used to read shared connections from Application.bot_data.
+DB_KEY = "db"
+REDIS_KEY = "redis"
+
+# In-memory fallback for the per-user message counter when Redis is unavailable.
+# Process-local and non-persistent, but keeps the feature working for local testing.
+_LOCAL_MESSAGE_COUNTS: dict[int, int] = {}
 
 BOT_COMMANDS = (
     ("start", "Show the main menu"),
@@ -36,15 +47,22 @@ Send a normal text message and the bot will echo it back."""
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     message = update.effective_message
     user = update.effective_user
-    if message is None:
+    if message is None or user is None:
         return
 
-    name = user.first_name if user and user.first_name else "friend"
+    # Persist the user in PostgreSQL when available (insert on first contact,
+    # refresh otherwise). Without a database the bot still greets the user.
+    pool = context.bot_data.get(DB_KEY)
+    is_new = True
+    if pool is not None:
+        is_new = await db.upsert_user(pool, user.id, user.username, user.first_name)
+
+    name = user.first_name if user.first_name else "friend"
+    greeting = "Welcome" if is_new else "Welcome back"
     await message.reply_text(
-        f"Hello, {name}! The bot is running.\n\n"
+        f"{greeting}, {name}! The bot is running.\n\n"
         "Choose a menu button below or type /help to see the available commands.",
         reply_markup=MAIN_MENU_KEYBOARD,
     )
@@ -71,12 +89,20 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     message = update.effective_message
     if message is None:
         return
 
-    await message.reply_text("pong")
+    # Demonstrate a short-lived Redis cache: warm within the TTL, cold otherwise.
+    # Without Redis we simply reply with a plain pong.
+    client = context.bot_data.get(REDIS_KEY)
+    if client is None:
+        await message.reply_text("pong")
+        return
+
+    cached = await cache.get_or_set_ping(client)
+    source = "cached" if cached else "fresh"
+    await message.reply_text(f"pong ({source})")
 
 
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -94,12 +120,19 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def echo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     message = update.effective_message
-    if message is None or not message.text:
+    user = update.effective_user
+    if message is None or not message.text or user is None:
         return
 
-    await message.reply_text(f"You sent:\n{message.text}")
+    # Track how many messages each user has sent using a Redis counter, falling
+    # back to an in-memory counter when Redis is unavailable.
+    client = context.bot_data.get(REDIS_KEY)
+    if client is not None:
+        count = await cache.increment_message_count(client, user.id)
+    else:
+        count = _LOCAL_MESSAGE_COUNTS[user.id] = _LOCAL_MESSAGE_COUNTS.get(user.id, 0) + 1
+    await message.reply_text(f"You sent (#{count}):\n{message.text}")
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -112,7 +145,16 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Error while processing update: %s", update, exc_info=context.error)
+    error = context.error
+
+    # Transient polling/network errors (e.g. a brief 409 Conflict during a
+    # Railway redeploy when two instances overlap) are self-healing, so log them
+    # as warnings without a traceback instead of alarming-looking errors.
+    if isinstance(error, (Conflict, NetworkError, TimedOut)):
+        logger.warning("Transient Telegram error: %s", error)
+        return
+
+    logger.exception("Error while processing update: %s", update, exc_info=error)
 
     if isinstance(update, Update) and update.effective_message:
         await update.effective_message.reply_text(
