@@ -16,6 +16,7 @@ STATUS_NO_REPLY = "no_reply"
 STATUS_REFUSED = "refused"
 STATUS_UNDER_16 = "under_16"
 STATUS_JOINED = "joined"
+STATUS_LEFT = "left"
 
 
 CREATE_CONTACTS_TABLE = """
