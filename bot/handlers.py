@@ -70,7 +70,9 @@ def get_menu_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def contact_keyboard(contact_id: int) -> InlineKeyboardMarkup:
+def contact_keyboard(
+    contact_id: int,
+) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
@@ -130,11 +132,24 @@ def get_admin_ids() -> set[int]:
 
 
 async def require_admin(update: Update) -> bool:
+    """
+    Allow DILEVA Base commands only to admins
+    and only in private chat.
+
+    In groups the bot stays completely silent.
+    """
+
     user = update.effective_user
     message = update.effective_message
 
     if user is None:
         return False
+
+    # DILEVA Base panel works only in private messages.
+    # The bot must not reply to ordinary group members.
+    if message is not None:
+        if message.chat.type != "private":
+            return False
 
     if user.id not in get_admin_ids():
         if message is not None:
@@ -198,14 +213,15 @@ async def chat_member_update(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """
-    Detect when a user joins a chat.
+    Automatically detect a new member joining a chat.
 
-    If the user already exists in contacts:
+    If the person already exists in contacts:
         save Telegram ID and move to joined.
 
-    If the user is not in contacts:
-        create a new contact automatically
-        and set joined.
+    If the person does not exist:
+        create a new contact and move to joined.
+
+    The bot does not send anything to the chat.
     """
 
     chat_member = update.chat_member
@@ -216,7 +232,6 @@ async def chat_member_update(
     old_status = chat_member.old_chat_member.status
     new_status = chat_member.new_chat_member.status
 
-    # We only care about an actual transition into membership.
     joined_statuses = {
         "member",
         "administrator",
@@ -231,7 +246,11 @@ async def chat_member_update(
 
     user = chat_member.new_chat_member.user
 
-    if user is None or user.is_bot:
+    if user is None:
+        return
+
+    # Ignore bots joining the chat.
+    if user.is_bot:
         return
 
     pool = context.bot_data.get(DB_KEY)
@@ -254,11 +273,14 @@ async def chat_member_update(
                 user.username,
             )
 
+        # If there is no existing contact,
+        # create one automatically.
         if contact is None:
+
             if not user.username:
                 logger.info(
-                    "User %s joined without username; "
-                    "cannot create username-based contact.",
+                    "User %s joined without username. "
+                    "Cannot create username-based contact.",
                     user.id,
                 )
                 return
@@ -276,6 +298,7 @@ async def chat_member_update(
             )
             return
 
+        # Save Telegram information.
         await db.update_telegram_user(
             pool,
             contact["id"],
@@ -284,6 +307,7 @@ async def chat_member_update(
             first_name=user.first_name,
         )
 
+        # Automatically move to joined.
         await db.update_status(
             pool,
             contact["id"],
@@ -292,11 +316,13 @@ async def chat_member_update(
             note="Automatic chat join detection",
         )
 
-        await db.release_contact(
-            pool,
-            contact["id"],
-            contact["claimed_by"],
-        ) if contact["claimed_by"] else None
+        # Release temporary admin claim if there was one.
+        if contact["claimed_by"]:
+            await db.release_contact(
+                pool,
+                contact["id"],
+                contact["claimed_by"],
+            )
 
         logger.info(
             "User @%s (%s) automatically moved to joined.",
@@ -331,28 +357,57 @@ async def menu_button(
     text = message.text.strip()
 
     if text == MENU_NEW:
-        await show_status(update, context, STATUS_NEW)
+        await show_status(
+            update,
+            context,
+            STATUS_NEW,
+        )
 
     elif text == MENU_NO_REPLY:
-        await show_status(update, context, STATUS_NO_REPLY)
+        await show_status(
+            update,
+            context,
+            STATUS_NO_REPLY,
+        )
 
     elif text == MENU_REFUSED:
-        await show_status(update, context, STATUS_REFUSED)
+        await show_status(
+            update,
+            context,
+            STATUS_REFUSED,
+        )
 
     elif text == MENU_UNDER_16:
-        await show_status(update, context, STATUS_UNDER_16)
+        await show_status(
+            update,
+            context,
+            STATUS_UNDER_16,
+        )
 
     elif text == MENU_JOINED:
-        await show_status(update, context, STATUS_JOINED)
+        await show_status(
+            update,
+            context,
+            STATUS_JOINED,
+        )
 
     elif text == MENU_SEARCH:
-        await search_start(update, context)
+        await search_start(
+            update,
+            context,
+        )
 
     elif text == MENU_IMPORT:
-        await import_start(update, context)
+        await import_start(
+            update,
+            context,
+        )
 
     elif text == MENU_STATS:
-        await statistics(update, context)
+        await statistics(
+            update,
+            context,
+        )
 
 
 # =========================
@@ -386,6 +441,7 @@ async def show_status(
             status,
             limit=50,
         )
+
     except Exception:
         logger.exception(
             "Failed to load contacts."
@@ -414,6 +470,7 @@ async def show_status(
     )
 
     for contact in contacts:
+
         text = f"👤 @{contact['username']}"
 
         if contact["age"] is not None:
@@ -477,6 +534,7 @@ async def contact_callback(
             ":",
             1,
         )
+
         contact_id = int(contact_id_raw)
 
     except (ValueError, AttributeError):
@@ -520,7 +578,6 @@ async def contact_callback(
             await query.answer(
                 "🔒 Контакт закреплён за тобой."
             )
-
         else:
             await query.answer(
                 "🔒 Его уже забрал другой админ.",
@@ -666,6 +723,7 @@ async def handle_age_input(
         return True
 
     if age < 16:
+
         await db.set_age_and_status(
             pool,
             contact_id,
@@ -677,6 +735,7 @@ async def handle_age_input(
         result = "🔞 Нету 16"
 
     else:
+
         await db.set_age_and_status(
             pool,
             contact_id,
@@ -853,6 +912,7 @@ async def import_users(
     seen = set()
 
     for username in usernames:
+
         normalized = username.lower()
 
         if normalized in seen:
@@ -865,6 +925,7 @@ async def import_users(
     skipped = 0
 
     for username in unique:
+
         existing = await db.get_contact_by_username(
             pool,
             username,
@@ -917,6 +978,7 @@ async def statistics(
         return
 
     try:
+
         total = await db.count_contacts(pool)
 
         new_count = await db.count_by_status(
@@ -1016,6 +1078,7 @@ async def expiration_job(
         return
 
     try:
+
         count = await db.return_expired_no_reply(
             pool
         )
