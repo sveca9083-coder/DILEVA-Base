@@ -2,13 +2,20 @@
 
 import logging
 import os
+import re
 
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
 )
 
@@ -18,11 +25,6 @@ logger = logging.getLogger(__name__)
 
 DB_KEY = "db"
 REDIS_KEY = "redis"
-
-
-# =========================
-# STATUSES
-# =========================
 
 STATUS_NEW = "new"
 STATUS_NO_REPLY = "no_reply"
@@ -38,11 +40,6 @@ STATUS_NAMES = {
     STATUS_JOINED: "✅ Вступил",
 }
 
-
-# =========================
-# MENU
-# =========================
-
 MENU_NEW = "🆕 Новые"
 MENU_NO_REPLY = "⏳ Не отвечает"
 MENU_REFUSED = "🚫 Отказано"
@@ -53,6 +50,10 @@ MENU_SEARCH = "🔎 Поиск"
 MENU_IMPORT = "📥 Импорт"
 MENU_STATS = "📊 Статистика"
 
+
+# =========================
+# KEYBOARD
+# =========================
 
 def get_menu_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
@@ -69,6 +70,39 @@ def get_menu_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def contact_keyboard(contact_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔒 Взять в работу",
+                    callback_data=f"claim:{contact_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⏳ Не отвечает",
+                    callback_data=f"no_reply:{contact_id}",
+                ),
+                InlineKeyboardButton(
+                    "🚫 Отказ",
+                    callback_data=f"refused:{contact_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔞 Нету 16",
+                    callback_data=f"under16:{contact_id}",
+                ),
+                InlineKeyboardButton(
+                    "✅ Вступил",
+                    callback_data=f"joined:{contact_id}",
+                ),
+            ],
+        ]
+    )
+
+
 # =========================
 # ADMIN
 # =========================
@@ -76,7 +110,7 @@ def get_menu_keyboard() -> ReplyKeyboardMarkup:
 def get_admin_ids() -> set[int]:
     raw = os.getenv("ADMIN_IDS", "")
 
-    admin_ids = set()
+    result = set()
 
     for value in raw.split(","):
         value = value.strip()
@@ -85,14 +119,14 @@ def get_admin_ids() -> set[int]:
             continue
 
         try:
-            admin_ids.add(int(value))
+            result.add(int(value))
         except ValueError:
             logger.warning(
                 "Invalid ADMIN_IDS value: %s",
                 value,
             )
 
-    return admin_ids
+    return result
 
 
 async def require_admin(update: Update) -> bool:
@@ -137,16 +171,16 @@ async def start(
         try:
             await db.upsert_user(
                 pool,
-                telegram_id=user.id,
-                username=user.username,
-                first_name=user.first_name,
+                user.id,
+                user.username,
+                user.first_name,
             )
         except Exception:
             logger.exception(
-                "Failed to save Telegram user."
+                "Failed to save admin."
             )
 
-    context.user_data.pop("mode", None)
+    context.user_data.clear()
 
     await message.reply_text(
         "👋 Добро пожаловать в DILEVA Base.\n\n"
@@ -156,7 +190,7 @@ async def start(
 
 
 # =========================
-# MENU BUTTON
+# MENU
 # =========================
 
 async def menu_button(
@@ -281,27 +315,349 @@ async def show_status(
         )
         return
 
-    lines = [
-        title,
-        "",
-    ]
+    await message.reply_text(
+        f"{title}\n\n"
+        "Нажми на username ниже:",
+    )
 
     for contact in contacts:
         username = contact["username"]
 
-        line = f"@{username}"
+        text = f"👤 @{username}"
+
+        if contact["age"] is not None:
+            text += (
+                f"\n🎂 Возраст: "
+                f"{contact['age']}"
+            )
 
         if contact["claimed_by"]:
-            line += (
-                "\n   🔒 Занят админом ID "
+            text += (
+                "\n🔒 Занят админом ID "
                 f"{contact['claimed_by']}"
             )
 
-        lines.append(line)
+        await message.reply_text(
+            text,
+            reply_markup=contact_keyboard(
+                contact["id"]
+            ),
+        )
+
+
+# =========================
+# CONTACT CALLBACKS
+# =========================
+
+async def contact_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    if query is None:
+        return
+
+    await query.answer()
+
+    user = query.from_user
+
+    if user.id not in get_admin_ids():
+        await query.answer(
+            "⛔ Нет доступа.",
+            show_alert=True,
+        )
+        return
+
+    pool = context.bot_data.get(DB_KEY)
+
+    if pool is None:
+        await query.answer(
+            "⚠️ База недоступна.",
+            show_alert=True,
+        )
+        return
+
+    data = query.data or ""
+
+    try:
+        action, contact_id_raw = data.split(
+            ":",
+            1,
+        )
+
+        contact_id = int(contact_id_raw)
+
+    except (ValueError, AttributeError):
+        await query.answer(
+            "❌ Некорректная команда.",
+            show_alert=True,
+        )
+        return
+
+    contact = await db.get_contact(
+        pool,
+        contact_id,
+    )
+
+    if contact is None:
+        await query.answer(
+            "❌ Контакт не найден.",
+            show_alert=True,
+        )
+        return
+
+    if action == "claim":
+        if contact["claimed_by"] not in (
+            None,
+            user.id,
+        ):
+            await query.answer(
+                "🔒 Этот человек уже обрабатывается другим админом.",
+                show_alert=True,
+            )
+            return
+
+        success = await db.claim_contact(
+            pool,
+            contact_id,
+            user.id,
+        )
+
+        if success:
+            await query.answer(
+                "🔒 Контакт закреплён за тобой."
+            )
+
+            await query.edit_message_reply_markup(
+                reply_markup=contact_keyboard(
+                    contact_id
+                )
+            )
+        else:
+            await query.answer(
+                "🔒 Его уже забрал другой админ.",
+                show_alert=True,
+            )
+
+        return
+
+    if action == "no_reply":
+        if (
+            contact["claimed_by"] is not None
+            and contact["claimed_by"] != user.id
+        ):
+            await query.answer(
+                "🔒 Этот контакт обрабатывает другой админ.",
+                show_alert=True,
+            )
+            return
+
+        await db.set_no_reply(
+            pool,
+            contact_id,
+            user.id,
+        )
+
+        await query.answer(
+            "⏳ Не отвечает. Таймер 48 часов запущен."
+        )
+
+        await query.edit_message_text(
+            f"👤 @{contact['username']}\n\n"
+            "📌 Статус: ⏳ Не отвечает\n"
+            "⏰ Через 48 часов контакт "
+            "вернётся в 🆕 Новые."
+        )
+
+        return
+
+    if action == "refused":
+        if (
+            contact["claimed_by"] is not None
+            and contact["claimed_by"] != user.id
+        ):
+            await query.answer(
+                "🔒 Этот контакт обрабатывает другой админ.",
+                show_alert=True,
+            )
+            return
+
+        await db.update_status(
+            pool,
+            contact_id,
+            STATUS_REFUSED,
+            user.id,
+        )
+
+        await db.release_contact(
+            pool,
+            contact_id,
+            user.id,
+        )
+
+        await query.answer(
+            "🚫 Отправлено в «Отказано»."
+        )
+
+        await query.edit_message_text(
+            f"👤 @{contact['username']}\n\n"
+            "📌 Статус: 🚫 Отказано"
+        )
+
+        return
+
+    if action == "under16":
+        if (
+            contact["claimed_by"] is not None
+            and contact["claimed_by"] != user.id
+        ):
+            await query.answer(
+                "🔒 Этот контакт обрабатывает другой админ.",
+                show_alert=True,
+            )
+            return
+
+        context.user_data["waiting_age"] = contact_id
+
+        await query.message.reply_text(
+            f"🔞 Введи возраст для @{contact['username']}.\n\n"
+            "Например: 15"
+        )
+
+        await query.answer()
+
+        return
+
+    if action == "joined":
+        if (
+            contact["claimed_by"] is not None
+            and contact["claimed_by"] != user.id
+        ):
+            await query.answer(
+                "🔒 Этот контакт обрабатывает другой админ.",
+                show_alert=True,
+            )
+            return
+
+        await db.update_status(
+            pool,
+            contact_id,
+            STATUS_JOINED,
+            user.id,
+        )
+
+        await db.release_contact(
+            pool,
+            contact_id,
+            user.id,
+        )
+
+        await query.answer(
+            "✅ Отправлено в «Вступил»."
+        )
+
+        await query.edit_message_text(
+            f"👤 @{contact['username']}\n\n"
+            "📌 Статус: ✅ Вступил"
+        )
+
+
+# =========================
+# AGE INPUT
+# =========================
+
+async def handle_age_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+
+    message = update.effective_message
+    pool = context.bot_data.get(DB_KEY)
+
+    if message is None or pool is None:
+        return False
+
+    contact_id = context.user_data.get(
+        "waiting_age"
+    )
+
+    if contact_id is None:
+        return False
+
+    text = message.text.strip()
+
+    if not text.isdigit():
+        await message.reply_text(
+            "❌ Введи возраст только цифрами.\n"
+            "Например: 15"
+        )
+        return True
+
+    age = int(text)
+
+    if age < 1 or age > 120:
+        await message.reply_text(
+            "❌ Некорректный возраст."
+        )
+        return True
+
+    contact = await db.get_contact(
+        pool,
+        contact_id,
+    )
+
+    if contact is None:
+        context.user_data.pop(
+            "waiting_age",
+            None,
+        )
+
+        await message.reply_text(
+            "❌ Контакт не найден."
+        )
+        return True
+
+    if age < 16:
+        status = STATUS_UNDER_16
+        result_text = "🔞 Нету 16"
+    else:
+        status = STATUS_NO_REPLY
+        result_text = "⏳ Не отвечает"
+
+    await db.set_age_and_status(
+        pool,
+        contact_id,
+        age,
+        status,
+        update.effective_user.id,
+    )
+
+    if status == STATUS_NO_REPLY:
+        await db.set_no_reply(
+            pool,
+            contact_id,
+            update.effective_user.id,
+        )
+
+    context.user_data.pop(
+        "waiting_age",
+        None,
+    )
 
     await message.reply_text(
-        "\n".join(lines)
+        f"👤 @{contact['username']}\n\n"
+        f"🎂 Возраст: {age}\n"
+        f"📌 Статус: {result_text}"
+        + (
+            "\n⏰ Таймер 48 часов запущен."
+            if status == STATUS_NO_REPLY
+            else ""
+        )
     )
+
+    return True
 
 
 # =========================
@@ -324,7 +680,7 @@ async def search_start(
     context.user_data["mode"] = "search"
 
     await message.reply_text(
-        "🔎 Введи username для поиска.\n\n"
+        "🔎 Введи username.\n\n"
         "Например:\n"
         "@username"
     )
@@ -348,34 +704,19 @@ async def search_user(
         await message.reply_text(
             "⚠️ База данных сейчас недоступна."
         )
-
-        context.user_data.pop("mode", None)
         return
 
     username = message.text.strip()
 
-    if not username:
-        await message.reply_text(
-            "❌ Введи username."
-        )
-        return
+    contact = await db.get_contact_by_username(
+        pool,
+        username,
+    )
 
-    try:
-        contact = await db.get_contact_by_username(
-            pool,
-            username,
-        )
-    except Exception:
-        logger.exception(
-            "Search failed."
-        )
-
-        await message.reply_text(
-            "❌ Ошибка поиска."
-        )
-        return
-
-    context.user_data.pop("mode", None)
+    context.user_data.pop(
+        "mode",
+        None,
+    )
 
     if contact is None:
         await message.reply_text(
@@ -384,36 +725,34 @@ async def search_user(
         )
         return
 
-    status_name = STATUS_NAMES.get(
-        contact["status"],
-        contact["status"],
+    text = (
+        "🔎 Найден пользователь\n\n"
+        f"👤 @{contact['username']}\n"
+        f"📌 Статус: "
+        f"{STATUS_NAMES.get(contact['status'], contact['status'])}"
     )
 
-    lines = [
-        "🔎 Найден пользователь",
-        "",
-        f"👤 @{contact['username']}",
-        f"📌 Статус: {status_name}",
-    ]
-
-    if contact["first_name"]:
-        lines.append(
-            f"📝 Имя: {contact['first_name']}"
+    if contact["age"] is not None:
+        text += (
+            f"\n🎂 Возраст: {contact['age']}"
         )
 
     if contact["claimed_by"]:
-        lines.append(
-            "🔒 Занят админом ID "
+        text += (
+            "\n🔒 Админ ID: "
             f"{contact['claimed_by']}"
         )
 
     if contact["notes"]:
-        lines.append(
-            f"💬 Заметка: {contact['notes']}"
+        text += (
+            f"\n📝 {contact['notes']}"
         )
 
     await message.reply_text(
-        "\n".join(lines)
+        text,
+        reply_markup=contact_keyboard(
+            contact["id"]
+        ),
     )
 
 
@@ -437,8 +776,7 @@ async def import_start(
     context.user_data["mode"] = "import"
 
     await message.reply_text(
-        "📥 Отправь список username.\n\n"
-        "По одному в строке:\n"
+        "📥 Отправь username по одному в строке:\n\n"
         "@user1\n"
         "@user2\n"
         "@user3"
@@ -456,39 +794,18 @@ async def import_users(
     message = update.effective_message
     pool = context.bot_data.get(DB_KEY)
 
-    if message is None:
+    if message is None or pool is None:
         return
-
-    if pool is None:
-        await message.reply_text(
-            "⚠️ База данных сейчас недоступна."
-        )
-
-        context.user_data.pop("mode", None)
-        return
-
-    raw_text = message.text or ""
 
     usernames = []
 
-    for line in raw_text.splitlines():
-        username = line.strip()
-
-        if not username:
-            continue
-
-        username = username.lstrip("@").strip()
+    for line in message.text.splitlines():
+        username = line.strip().lstrip("@")
 
         if username:
             usernames.append(username)
 
-    if not usernames:
-        await message.reply_text(
-            "❌ Не нашла ни одного username."
-        )
-        return
-
-    unique_usernames = []
+    unique = []
     seen = set()
 
     for username in usernames:
@@ -498,42 +815,37 @@ async def import_users(
             continue
 
         seen.add(normalized)
-        unique_usernames.append(username)
+        unique.append(username)
 
     added = 0
     skipped = 0
 
-    for username in unique_usernames:
-        try:
-            existing = await db.get_contact_by_username(
-                pool,
-                username,
-            )
+    for username in unique:
+        existing = await db.get_contact_by_username(
+            pool,
+            username,
+        )
 
-            if existing is not None:
-                skipped += 1
-                continue
+        if existing is not None:
+            skipped += 1
+            continue
 
-            contact = await db.add_contact(
-                pool,
-                username=username,
-                added_by=update.effective_user.id,
-                source="import",
-            )
+        contact = await db.add_contact(
+            pool,
+            username,
+            added_by=update.effective_user.id,
+            source="import",
+        )
 
-            if contact is not None:
-                added += 1
-            else:
-                skipped += 1
-
-        except Exception:
-            logger.exception(
-                "Failed to import @%s",
-                username,
-            )
+        if contact is not None:
+            added += 1
+        else:
             skipped += 1
 
-    context.user_data.pop("mode", None)
+    context.user_data.pop(
+        "mode",
+        None,
+    )
 
     await message.reply_text(
         "📥 Импорт завершён.\n\n"
@@ -557,13 +869,7 @@ async def statistics(
     message = update.effective_message
     pool = context.bot_data.get(DB_KEY)
 
-    if message is None:
-        return
-
-    if pool is None:
-        await message.reply_text(
-            "⚠️ База данных сейчас недоступна."
-        )
+    if message is None or pool is None:
         return
 
     try:
@@ -596,7 +902,7 @@ async def statistics(
 
     except Exception:
         logger.exception(
-            "Failed to get statistics."
+            "Statistics error."
         )
 
         await message.reply_text(
@@ -627,7 +933,15 @@ async def text_router(
     if not await require_admin(update):
         return
 
-    mode = context.user_data.get("mode")
+    if await handle_age_input(
+        update,
+        context,
+    ):
+        return
+
+    mode = context.user_data.get(
+        "mode"
+    )
 
     if mode == "search":
         await search_user(
@@ -645,7 +959,37 @@ async def text_router(
 
 
 # =========================
-# ERROR HANDLER
+# AUTOMATIC 48 HOURS
+# =========================
+
+async def expiration_job(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    pool = context.bot_data.get(DB_KEY)
+
+    if pool is None:
+        return
+
+    try:
+        count = await db.return_expired_no_reply(
+            pool
+        )
+
+        if count:
+            logger.info(
+                "Returned %s contacts to new queue.",
+                count,
+            )
+
+    except Exception:
+        logger.exception(
+            "Expiration job failed."
+        )
+
+
+# =========================
+# ERROR
 # =========================
 
 async def error_handler(
@@ -660,7 +1004,7 @@ async def error_handler(
 
 
 # =========================
-# BOT COMMANDS
+# COMMANDS
 # =========================
 
 async def set_bot_commands(
@@ -693,6 +1037,13 @@ def register_handlers(
     )
 
     application.add_handler(
+        CallbackQueryHandler(
+            contact_callback,
+            pattern=r"^(claim|no_reply|refused|under16|joined):\d+$",
+        )
+    )
+
+    application.add_handler(
         MessageHandler(
             filters.Regex(
                 r"^(🆕 Новые|⏳ Не отвечает|🚫 Отказано|🔞 Нету 16|✅ Вступил|🔎 Поиск|📥 Импорт|📊 Статистика)$"
@@ -707,3 +1058,10 @@ def register_handlers(
             text_router,
         )
     )
+
+    if application.job_queue is not None:
+        application.job_queue.run_repeating(
+            expiration_job,
+            interval=300,
+            first=10,
+        )
