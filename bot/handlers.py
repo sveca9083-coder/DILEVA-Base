@@ -19,6 +19,7 @@ from bot import db
 logger = logging.getLogger(__name__)
 
 DB_KEY = "db"
+REDIS_KEY = "redis"
 
 
 # ============================================================
