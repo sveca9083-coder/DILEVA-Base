@@ -3,8 +3,7 @@
 import logging
 import os
 
-from telegram import ReplyKeyboardMarkup, Update
-from telegram.error import Conflict, NetworkError, TimedOut
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,49 +14,15 @@ from telegram.ext import (
 
 from bot import db
 
-
 logger = logging.getLogger(__name__)
 
 DB_KEY = "db"
 REDIS_KEY = "redis"
 
 
-# ============================================================
-# ADMIN ACCESS
-# ============================================================
-
-def get_admin_ids() -> set[int]:
-    raw = os.getenv("ADMIN_IDS", "")
-    return {
-        int(value.strip())
-        for value in raw.split(",")
-        if value.strip().isdigit()
-    }
-
-
-def is_admin(user_id: int | None) -> bool:
-    return user_id is not None and user_id in get_admin_ids()
-
-
-async def require_admin(update: Update) -> bool:
-    user = update.effective_user
-    message = update.effective_message
-
-    if user is None or message is None:
-        return False
-
-    if not is_admin(user.id):
-        await message.reply_text(
-            "⛔ У тебя нет доступа к DILEVA Base."
-        )
-        return False
-
-    return True
-
-
-# ============================================================
+# =========================
 # STATUSES
-# ============================================================
+# =========================
 
 STATUS_NEW = "new"
 STATUS_NO_REPLY = "no_reply"
@@ -74,9 +39,9 @@ STATUS_NAMES = {
 }
 
 
-# ============================================================
+# =========================
 # MENU
-# ============================================================
+# =========================
 
 MENU_NEW = "🆕 Новые"
 MENU_NO_REPLY = "⏳ Не отвечает"
@@ -89,28 +54,68 @@ MENU_IMPORT = "📥 Импорт"
 MENU_STATS = "📊 Статистика"
 
 
-MAIN_MENU = ReplyKeyboardMarkup(
-    [
+def get_menu_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
         [MENU_NEW, MENU_NO_REPLY],
         [MENU_REFUSED, MENU_UNDER_16],
         [MENU_JOINED],
         [MENU_SEARCH, MENU_IMPORT],
         [MENU_STATS],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
-    input_field_placeholder="Выбери раздел",
-)
+    ]
+
+    return ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True,
+    )
 
 
-BOT_COMMANDS = (
-    ("start", "Открыть DILEVA Base"),
-)
+# =========================
+# ADMIN
+# =========================
+
+def get_admin_ids() -> set[int]:
+    raw = os.getenv("ADMIN_IDS", "")
+
+    admin_ids = set()
+
+    for value in raw.split(","):
+        value = value.strip()
+
+        if not value:
+            continue
+
+        try:
+            admin_ids.add(int(value))
+        except ValueError:
+            logger.warning(
+                "Invalid ADMIN_IDS value: %s",
+                value,
+            )
+
+    return admin_ids
 
 
-# ============================================================
+async def require_admin(update: Update) -> bool:
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None:
+        return False
+
+    if user.id not in get_admin_ids():
+        if message is not None:
+            await message.reply_text(
+                "⛔ У тебя нет доступа к DILEVA Base."
+            )
+
+        return False
+
+    return True
+
+
+# =========================
 # START
-# ============================================================
+# =========================
 
 async def start(
     update: Update,
@@ -120,32 +125,112 @@ async def start(
     if not await require_admin(update):
         return
 
-    message = update.effective_message
     user = update.effective_user
+    message = update.effective_message
 
-    if message is None or user is None:
+    if user is None or message is None:
         return
 
     pool = context.bot_data.get(DB_KEY)
 
     if pool is not None:
-        await db.upsert_user(
-            pool,
-            user.id,
-            user.username,
-            user.first_name,
-        )
+        try:
+            await db.upsert_user(
+                pool,
+                telegram_id=user.id,
+                username=user.username,
+                first_name=user.first_name,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to save Telegram user."
+            )
+
+    context.user_data.pop("mode", None)
 
     await message.reply_text(
-        "👋 Добро пожаловать в DILEVA Base!\n\n"
-        "Выбери нужный раздел:",
-        reply_markup=MAIN_MENU,
+        "👋 Добро пожаловать в DILEVA Base.\n\n"
+        "Выбирай раздел:",
+        reply_markup=get_menu_keyboard(),
     )
 
 
-# ============================================================
+# =========================
+# MENU BUTTON
+# =========================
+
+async def menu_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    if not await require_admin(update):
+        return
+
+    message = update.effective_message
+
+    if message is None or not message.text:
+        return
+
+    text = message.text.strip()
+
+    if text == MENU_NEW:
+        await show_status(
+            update,
+            context,
+            STATUS_NEW,
+        )
+
+    elif text == MENU_NO_REPLY:
+        await show_status(
+            update,
+            context,
+            STATUS_NO_REPLY,
+        )
+
+    elif text == MENU_REFUSED:
+        await show_status(
+            update,
+            context,
+            STATUS_REFUSED,
+        )
+
+    elif text == MENU_UNDER_16:
+        await show_status(
+            update,
+            context,
+            STATUS_UNDER_16,
+        )
+
+    elif text == MENU_JOINED:
+        await show_status(
+            update,
+            context,
+            STATUS_JOINED,
+        )
+
+    elif text == MENU_SEARCH:
+        await search_start(
+            update,
+            context,
+        )
+
+    elif text == MENU_IMPORT:
+        await import_start(
+            update,
+            context,
+        )
+
+    elif text == MENU_STATS:
+        await statistics(
+            update,
+            context,
+        )
+
+
+# =========================
 # STATUS LIST
-# ============================================================
+# =========================
 
 async def show_status(
     update: Update,
@@ -167,39 +252,61 @@ async def show_status(
             "⚠️ База данных сейчас недоступна."
         )
         return
-contacts = await db.get_contacts_by_status(
-    pool,
-    status,
-    limit=50,
-)
-    
-    title = STATUS_NAMES[status]
 
-    if not contacts:
+    try:
+        contacts = await db.get_contacts_by_status(
+            pool,
+            status,
+            limit=50,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to load contacts."
+        )
+
         await message.reply_text(
-            f"{title}\n\nПока здесь никого нет."
+            "❌ Не удалось загрузить список."
         )
         return
 
-    lines = [title, ""]
+    title = STATUS_NAMES.get(
+        status,
+        status,
+    )
+
+    if not contacts:
+        await message.reply_text(
+            f"{title}\n\n"
+            "Пока здесь никого нет."
+        )
+        return
+
+    lines = [
+        title,
+        "",
+    ]
 
     for contact in contacts:
-       username = contact["username"]
+        username = contact["username"]
 
-name = f"@{username}"
+        line = f"@{username}"
 
-if contact["claimed_by"]:
-    name += f"\n   🔒 Занят админом ID {contact['claimed_by']}" 
-        lines.append(name)
+        if contact["claimed_by"]:
+            line += (
+                "\n   🔒 Занят админом ID "
+                f"{contact['claimed_by']}"
+            )
+
+        lines.append(line)
 
     await message.reply_text(
         "\n".join(lines)
     )
 
 
-# ============================================================
+# =========================
 # SEARCH
-# ============================================================
+# =========================
 
 async def search_start(
     update: Update,
@@ -209,11 +316,17 @@ async def search_start(
     if not await require_admin(update):
         return
 
+    message = update.effective_message
+
+    if message is None:
+        return
+
     context.user_data["mode"] = "search"
 
-    await update.effective_message.reply_text(
+    await message.reply_text(
         "🔎 Введи username для поиска.\n\n"
-        "Можно с @ или без него."
+        "Например:\n"
+        "@username"
     )
 
 
@@ -225,85 +338,88 @@ async def search_user(
     if not await require_admin(update):
         return
 
-    if context.user_data.get("mode") != "search":
-        return
-
     message = update.effective_message
-
-    if message is None or not message.text:
-        return
-
-    context.user_data.pop("mode", None)
-
-    username = message.text.strip().lstrip("@")
-
     pool = context.bot_data.get(DB_KEY)
+
+    if message is None:
+        return
 
     if pool is None:
         await message.reply_text(
             "⚠️ База данных сейчас недоступна."
         )
+
+        context.user_data.pop("mode", None)
         return
 
-     contact = await db.get_contact_by_username(
-    pool,
-    username,
-)
+    username = message.text.strip()
 
-    if contact is None:
+    if not username:
         await message.reply_text(
-            f"❌ @{username} не найден."
+            "❌ Введи username."
         )
         return
 
-    status = STATUS_NAMES.get(
-    contact["status"],
-    contact["status"],
-)
+    try:
+        contact = await db.get_contact_by_username(
+            pool,
+            username,
+        )
+    except Exception:
+        logger.exception(
+            "Search failed."
+        )
 
-text = (
-    "🔎 Контакт найден\n\n"
-    f"👤 @{contact['username']}\n"
-    f"📌 {status}\n"
-)
+        await message.reply_text(
+            "❌ Ошибка поиска."
+        )
+        return
 
-if contact["telegram_id"]:
-    text += f"🆔 {contact['telegram_id']}\n"
+    context.user_data.pop("mode", None)
 
-if contact["source"]:
-    text += f"📍 Источник: {contact['source']}\n"
+    if contact is None:
+        await message.reply_text(
+            f"🔎 @{username.lstrip('@')}\n\n"
+            "❌ Пользователь не найден."
+        )
+        return
 
-if contact["notes"]:
-    text += f"📝 Заметка: {contact['notes']}\n"
-
-if contact["claimed_by"]:
-    text += (
-        f"🔒 Закреплён за админом "
-        f"{contact['claimed_by']}\n"
+    status_name = STATUS_NAMES.get(
+        contact["status"],
+        contact["status"],
     )
 
-         
+    lines = [
+        "🔎 Найден пользователь",
+        "",
+        f"👤 @{contact['username']}",
+        f"📌 Статус: {status_name}",
+    ]
 
-    await message.reply_text(text)
+    if contact["first_name"]:
+        lines.append(
+            f"📝 Имя: {contact['first_name']}"
+        )
 
-async def text_router(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """Route normal text messages according to the current mode."""
+    if contact["claimed_by"]:
+        lines.append(
+            "🔒 Занят админом ID "
+            f"{contact['claimed_by']}"
+        )
 
-    mode = context.user_data.get("mode")
+    if contact["notes"]:
+        lines.append(
+            f"💬 Заметка: {contact['notes']}"
+        )
 
-    if mode == "search":
-        await search_user(update, context)
-        return
+    await message.reply_text(
+        "\n".join(lines)
+    )
 
-    if mode == "import":
-        await import_users(update, context)
-        return
-# ============================================================
+
+# =========================
 # IMPORT
-# ============================================================
+# =========================
 
 async def import_start(
     update: Update,
@@ -313,17 +429,21 @@ async def import_start(
     if not await require_admin(update):
         return
 
+    message = update.effective_message
+
+    if message is None:
+        return
+
     context.user_data["mode"] = "import"
 
-    await update.effective_message.reply_text(
-        "📥 Импорт\n\n"
-        "Отправь usernames одним сообщением.\n"
-        "Каждый username — с новой строки.\n\n"
-        "Например:\n"
-        "@username1\n"
-        "@username2\n"
-        "username3"
+    await message.reply_text(
+        "📥 Отправь список username.\n\n"
+        "По одному в строке:\n"
+        "@user1\n"
+        "@user2\n"
+        "@user3"
     )
+
 
 async def import_users(
     update: Update,
@@ -333,76 +453,98 @@ async def import_users(
     if not await require_admin(update):
         return
 
-    if context.user_data.get("mode") != "import":
-        return
-
     message = update.effective_message
-
-    if message is None or not message.text:
-        return
-
-    context.user_data.pop("mode", None)
-
     pool = context.bot_data.get(DB_KEY)
+
+    if message is None:
+        return
 
     if pool is None:
         await message.reply_text(
             "⚠️ База данных сейчас недоступна."
         )
+
+        context.user_data.pop("mode", None)
         return
+
+    raw_text = message.text or ""
 
     usernames = []
 
-    for line in message.text.splitlines():
-        username = line.strip().lstrip("@").strip()
+    for line in raw_text.splitlines():
+        username = line.strip()
+
+        if not username:
+            continue
+
+        username = username.lstrip("@").strip()
 
         if username:
             usernames.append(username)
 
-    usernames = list(dict.fromkeys(
-        username.lower()
-        for username in usernames
-    ))
-
     if not usernames:
         await message.reply_text(
-            "❌ Не найдено ни одного username."
+            "❌ Не нашла ни одного username."
         )
         return
+
+    unique_usernames = []
+    seen = set()
+
+    for username in usernames:
+        normalized = username.lower()
+
+        if normalized in seen:
+            continue
+
+        seen.add(normalized)
+        unique_usernames.append(username)
 
     added = 0
     skipped = 0
 
-    for username in usernames:
+    for username in unique_usernames:
+        try:
+            existing = await db.get_contact_by_username(
+                pool,
+                username,
+            )
 
-        existing = await db.get_contact_by_username(
-            pool,
-            username,
-        )
+            if existing is not None:
+                skipped += 1
+                continue
 
-        if existing:
+            contact = await db.add_contact(
+                pool,
+                username=username,
+                added_by=update.effective_user.id,
+                source="import",
+            )
+
+            if contact is not None:
+                added += 1
+            else:
+                skipped += 1
+
+        except Exception:
+            logger.exception(
+                "Failed to import @%s",
+                username,
+            )
             skipped += 1
-            continue
 
-        await db.add_contact(
-            pool,
-            username,
-            added_by=update.effective_user.id,
-            source="import",
-        )
-
-        added += 1
+    context.user_data.pop("mode", None)
 
     await message.reply_text(
         "📥 Импорт завершён.\n\n"
         f"✅ Добавлено: {added}\n"
-        f"⏭ Уже были в базе: {skipped}\n"
-        f"📊 Всего обработано: {len(usernames)}"
+        f"⏭ Пропущено: {skipped}"
     )
 
-# ============================================================
+
+# =========================
 # STATISTICS
-# ============================================================
+# =========================
 
 async def statistics(
     update: Update,
@@ -424,29 +566,60 @@ async def statistics(
         )
         return
 
-    total = await db.count_contacts(pool)
-    new = await db.count_by_status(pool, STATUS_NEW)
-    no_reply = await db.count_by_status(pool, STATUS_NO_REPLY)
-    refused = await db.count_by_status(pool, STATUS_REFUSED)
-    under_16 = await db.count_by_status(pool, STATUS_UNDER_16)
-    joined = await db.count_by_status(pool, STATUS_JOINED)
+    try:
+        total = await db.count_contacts(pool)
+
+        new_count = await db.count_by_status(
+            pool,
+            STATUS_NEW,
+        )
+
+        no_reply_count = await db.count_by_status(
+            pool,
+            STATUS_NO_REPLY,
+        )
+
+        refused_count = await db.count_by_status(
+            pool,
+            STATUS_REFUSED,
+        )
+
+        under_16_count = await db.count_by_status(
+            pool,
+            STATUS_UNDER_16,
+        )
+
+        joined_count = await db.count_by_status(
+            pool,
+            STATUS_JOINED,
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to get statistics."
+        )
+
+        await message.reply_text(
+            "❌ Не удалось получить статистику."
+        )
+        return
 
     await message.reply_text(
         "📊 Статистика DILEVA Base\n\n"
         f"👥 Всего: {total}\n\n"
-        f"🆕 Новые: {new}\n"
-        f"⏳ Не отвечает: {no_reply}\n"
-        f"🚫 Отказано: {refused}\n"
-        f"🔞 Нету 16: {under_16}\n"
-        f"✅ Вступил: {joined}"
+        f"🆕 Новые: {new_count}\n"
+        f"⏳ Не отвечает: {no_reply_count}\n"
+        f"🚫 Отказано: {refused_count}\n"
+        f"🔞 Нету 16: {under_16_count}\n"
+        f"✅ Вступил: {joined_count}"
     )
 
 
-# ============================================================
-# MENU
-# ============================================================
+# =========================
+# TEXT ROUTER
+# =========================
 
-async def menu_button(
+async def text_router(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
@@ -454,111 +627,76 @@ async def menu_button(
     if not await require_admin(update):
         return
 
-    message = update.effective_message
+    mode = context.user_data.get("mode")
 
-    if message is None or not message.text:
+    if mode == "search":
+        await search_user(
+            update,
+            context,
+        )
         return
 
-    text = message.text.strip()
-
-    if text == MENU_NEW:
-        await show_status(update, context, STATUS_NEW)
-
-    elif text == MENU_NO_REPLY:
-        await show_status(update, context, STATUS_NO_REPLY)
-
-    elif text == MENU_REFUSED:
-        await show_status(update, context, STATUS_REFUSED)
-
-    elif text == MENU_UNDER_16:
-        await show_status(update, context, STATUS_UNDER_16)
-
-    elif text == MENU_JOINED:
-        await show_status(update, context, STATUS_JOINED)
-
-    elif text == MENU_SEARCH:
-        await search_start(update, context)
-
-    elif text == MENU_IMPORT:
-        await import_start(update, context)
-
-    elif text == MENU_STATS:
-        await statistics(update, context)
+    if mode == "import":
+        await import_users(
+            update,
+            context,
+        )
+        return
 
 
-# ============================================================
+# =========================
 # ERROR HANDLER
-# ============================================================
+# =========================
 
 async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
 
-    error = context.error
-
-    if isinstance(
-        error,
-        (Conflict, NetworkError, TimedOut),
-    ):
-        logger.warning(
-            "Transient Telegram error: %s",
-            error,
-        )
-        return
-
-    logger.exception(
-        "Error while processing update: %s",
-        update,
-        exc_info=error,
+    logger.error(
+        "Unhandled exception:",
+        exc_info=context.error,
     )
 
 
-# ============================================================
-# COMMANDS
-# ============================================================
+# =========================
+# BOT COMMANDS
+# =========================
 
 async def set_bot_commands(
     application: Application,
 ) -> None:
 
     await application.bot.set_my_commands(
-        BOT_COMMANDS
+        [
+            (
+                "start",
+                "Запустить DILEVA Base",
+            ),
+        ]
     )
 
 
-# ============================================================
-# REGISTRATION
-# ============================================================
+# =========================
+# REGISTER
+# =========================
 
 def register_handlers(
     application: Application,
 ) -> None:
 
     application.add_handler(
-        CommandHandler("start", start)
-    )
-
-    menu_pattern = (
-        "^("
-        + "|".join(
-            [
-                MENU_NEW,
-                MENU_NO_REPLY,
-                MENU_REFUSED,
-                MENU_UNDER_16,
-                MENU_JOINED,
-                MENU_SEARCH,
-                MENU_IMPORT,
-                MENU_STATS,
-            ]
+        CommandHandler(
+            "start",
+            start,
         )
-        + ")$"
     )
 
     application.add_handler(
         MessageHandler(
-            filters.Regex(menu_pattern),
+            filters.Regex(
+                r"^(🆕 Новые|⏳ Не отвечает|🚫 Отказано|🔞 Нету 16|✅ Вступил|🔎 Поиск|📥 Импорт|📊 Статистика)$"
+            ),
             menu_button,
         )
     )
