@@ -167,16 +167,15 @@ async def show_status(
             "⚠️ База данных сейчас недоступна."
         )
         return
-
-    users = await db.get_users_by_status(
-        pool,
-        status,
-        limit=50,
-    )
-
+contacts = await db.get_contacts_by_status(
+    pool,
+    status,
+    limit=50,
+).  
+    
     title = STATUS_NAMES[status]
 
-    if not users:
+    if not contacts:
         await message.reply_text(
             f"{title}\n\nПока здесь никого нет."
         )
@@ -184,17 +183,13 @@ async def show_status(
 
     lines = [title, ""]
 
-    for user in users:
-        username = user["username"]
+    for contact in contacts:
+       username = contact["username"]
 
-        if username:
-            name = f"@{username}"
-        else:
-            name = user["first_name"] or str(user["telegram_id"])
+name = f"@{username}"
 
-        if user["claimed_by"]:
-            name += f"\n   🔒 Занят админом ID {user['claimed_by']}"
-
+if contact["claimed_by"]:
+    name += f"\n   🔒 Занят админом ID {contact['claimed_by']}" 
         lines.append(name)
 
     await message.reply_text(
@@ -250,44 +245,62 @@ async def search_user(
         )
         return
 
-    user = await db.get_user_by_username(
-        pool,
-        username,
-    )
+     contact = await db.get_contact_by_username(
+    pool,
+    username,
+)
 
-    if user is None:
+    if contact is None:
         await message.reply_text(
             f"❌ @{username} не найден."
         )
         return
 
     status = STATUS_NAMES.get(
-        user["status"],
-        user["status"],
+    contact["status"],
+    contact["status"],
+)
+
+text = (
+    "🔎 Контакт найден\n\n"
+    f"👤 @{contact['username']}\n"
+    f"📌 {status}\n"
+)
+
+if contact["telegram_id"]:
+    text += f"🆔 {contact['telegram_id']}\n"
+
+if contact["source"]:
+    text += f"📍 Источник: {contact['source']}\n"
+
+if contact["notes"]:
+    text += f"📝 Заметка: {contact['notes']}\n"
+
+if contact["claimed_by"]:
+    text += (
+        f"🔒 Закреплён за админом "
+        f"{contact['claimed_by']}\n"
     )
 
-    text = (
-        "🔎 Пользователь найден\n\n"
-        f"👤 @{user['username'] or 'без username'}\n"
-        f"🆔 {user['telegram_id']}\n"
-        f"📌 {status}\n"
-    )
-
-    if user["source"]:
-        text += f"📍 Источник: {user['source']}\n"
-
-    if user["notes"]:
-        text += f"📝 Заметка: {user['notes']}\n"
-
-    if user["claimed_by"]:
-        text += (
-            f"🔒 Закреплён за админом "
-            f"{user['claimed_by']}\n"
-        )
+         
 
     await message.reply_text(text)
 
+async def text_router(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Route normal text messages according to the current mode."""
 
+    mode = context.user_data.get("mode")
+
+    if mode == "search":
+        await search_user(update, context)
+        return
+
+    if mode == "import":
+        await import_users(update, context)
+        return
 # ============================================================
 # IMPORT
 # ============================================================
@@ -311,7 +324,6 @@ async def import_start(
         "@username2\n"
         "username3"
     )
-
 
 async def import_users(
     update: Update,
@@ -363,7 +375,7 @@ async def import_users(
 
     for username in usernames:
 
-        existing = await db.get_user_by_username(
+        existing = await db.get_contact_by_username(
             pool,
             username,
         )
@@ -372,21 +384,21 @@ async def import_users(
             skipped += 1
             continue
 
-        # Для импортированных username Telegram ID пока неизвестен.
-        # Создаём запись с NULL ID через отдельную таблицу позже.
-        # Сейчас такие записи не добавляем, чтобы не создавать
-        # искусственные Telegram ID.
+        await db.add_contact(
+            pool,
+            username,
+            added_by=update.effective_user.id,
+            source="import",
+        )
 
-        skipped += 1
+        added += 1
 
     await message.reply_text(
-        "📥 Проверка завершена.\n\n"
-        f"👤 Получено username: {len(usernames)}\n"
-        f"⏭ Пока пропущено: {skipped}\n\n"
-        "⚠️ Импорт без Telegram ID пока отключён.\n"
-        "Сначала добавим правильную таблицу для внешних username."
+        "📥 Импорт завершён.\n\n"
+        f"✅ Добавлено: {added}\n"
+        f"⏭ Уже были в базе: {skipped}\n"
+        f"📊 Всего обработано: {len(usernames)}"
     )
-
 
 # ============================================================
 # STATISTICS
@@ -412,7 +424,7 @@ async def statistics(
         )
         return
 
-    total = await db.count_users(pool)
+    total = await db.count_contacts(pool)
     new = await db.count_by_status(pool, STATUS_NEW)
     no_reply = await db.count_by_status(pool, STATUS_NO_REPLY)
     refused = await db.count_by_status(pool, STATUS_REFUSED)
@@ -554,13 +566,6 @@ def register_handlers(
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            search_user,
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            import_users,
+            text_router,
         )
     )
