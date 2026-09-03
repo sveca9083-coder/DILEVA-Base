@@ -171,7 +171,7 @@ contacts = await db.get_contacts_by_status(
     pool,
     status,
     limit=50,
-).  
+)
     
     title = STATUS_NAMES[status]
 
