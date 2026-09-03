@@ -348,7 +348,37 @@ async def count_by_status(
             status,
         )
     )
+async def upsert_user(
+    pool: asyncpg.Pool,
+    telegram_id: int,
+    username: str | None,
+    first_name: str | None,
+) -> bool:
+    """Insert or update a Telegram bot user in the existing users table."""
 
+    result = await pool.fetchrow(
+        """
+        INSERT INTO users (
+            telegram_id,
+            username,
+            first_name
+        )
+        VALUES ($1, $2, $3)
+
+        ON CONFLICT (telegram_id) DO UPDATE
+        SET
+            username = EXCLUDED.username,
+            first_name = EXCLUDED.first_name,
+            last_seen = now()
+
+        RETURNING (xmax = 0) AS is_new;
+        """,
+        telegram_id,
+        username,
+        first_name,
+    )
+
+    return bool(result["is_new"])
 
 async def close_pool(pool: asyncpg.Pool) -> None:
     """Close PostgreSQL connection pool."""
