@@ -1,7 +1,7 @@
 """PostgreSQL database layer for DILEVA Base."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import asyncpg
 
@@ -10,6 +10,12 @@ logger = logging.getLogger(__name__)
 POOL_MIN_SIZE = 1
 POOL_MAX_SIZE = 10
 COMMAND_TIMEOUT = 10.0
+
+STATUS_NEW = "new"
+STATUS_NO_REPLY = "no_reply"
+STATUS_REFUSED = "refused"
+STATUS_UNDER_16 = "under_16"
+STATUS_JOINED = "joined"
 
 
 CREATE_CONTACTS_TABLE = """
@@ -23,6 +29,8 @@ CREATE TABLE IF NOT EXISTS contacts (
     first_name TEXT,
 
     status TEXT NOT NULL DEFAULT 'new',
+
+    age INTEGER,
 
     source TEXT,
     added_by BIGINT,
@@ -62,6 +70,51 @@ CREATE TABLE IF NOT EXISTS actions (
 """
 
 
+ALTER_CONTACTS_TABLE = """
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS age INTEGER;
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS telegram_id BIGINT;
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS first_name TEXT;
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'new';
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS source TEXT;
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS added_by BIGINT;
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS claimed_by BIGINT;
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS notes TEXT;
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS last_contact_at TIMESTAMPTZ;
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS next_check_at TIMESTAMPTZ;
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE contacts
+    ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ NOT NULL DEFAULT now();
+"""
+
+
 async def create_pool(dsn: str) -> asyncpg.Pool:
     """Open PostgreSQL connection pool and initialize DILEVA tables."""
 
@@ -74,11 +127,17 @@ async def create_pool(dsn: str) -> asyncpg.Pool:
 
     async with pool.acquire() as conn:
         await conn.execute(CREATE_CONTACTS_TABLE)
+        await conn.execute(ALTER_CONTACTS_TABLE)
         await conn.execute(CREATE_ACTIONS_TABLE)
 
     logger.info("PostgreSQL pool ready.")
+
     return pool
 
+
+# =========================
+# CONTACTS
+# =========================
 
 async def add_contact(
     pool: asyncpg.Pool,
@@ -86,7 +145,7 @@ async def add_contact(
     added_by: int | None = None,
     source: str | None = None,
 ):
-    """Add a username to DILEVA Base without creating a fake Telegram ID."""
+    """Add a username to DILEVA Base."""
 
     username = username.strip().lstrip("@")
 
@@ -153,6 +212,54 @@ async def get_contact_by_username(
     )
 
 
+async def get_contact_by_telegram_id(
+    pool: asyncpg.Pool,
+    telegram_id: int,
+):
+    """Find contact by Telegram ID."""
+
+    return await pool.fetchrow(
+        """
+        SELECT *
+        FROM contacts
+        WHERE telegram_id = $1;
+        """,
+        telegram_id,
+    )
+
+
+async def update_telegram_user(
+    pool: asyncpg.Pool,
+    contact_id: int,
+    telegram_id: int,
+    username: str | None = None,
+    first_name: str | None = None,
+):
+    """Save Telegram information for a contact."""
+
+    return await pool.fetchrow(
+        """
+        UPDATE contacts
+        SET
+            telegram_id = $1,
+            username = COALESCE($2, username),
+            username_normalized = COALESCE(
+                LOWER(NULLIF($2, '')),
+                username_normalized
+            ),
+            first_name = COALESCE($3, first_name),
+            last_seen = now(),
+            updated_at = now()
+        WHERE id = $4
+        RETURNING *;
+        """,
+        telegram_id,
+        username,
+        first_name,
+        contact_id,
+    )
+
+
 async def get_contacts_by_status(
     pool: asyncpg.Pool,
     status: str,
@@ -173,6 +280,10 @@ async def get_contacts_by_status(
     )
 
 
+# =========================
+# STATUS
+# =========================
+
 async def update_status(
     pool: asyncpg.Pool,
     contact_id: int,
@@ -182,7 +293,10 @@ async def update_status(
 ) -> bool:
     """Change contact status and save the action."""
 
-    contact = await get_contact(pool, contact_id)
+    contact = await get_contact(
+        pool,
+        contact_id,
+    )
 
     if contact is None:
         return False
@@ -211,7 +325,14 @@ async def update_status(
             new_status,
             note
         )
-        VALUES ($1, $2, 'status_change', $3, $4, $5);
+        VALUES (
+            $1,
+            $2,
+            'status_change',
+            $3,
+            $4,
+            $5
+        );
         """,
         contact_id,
         admin_id,
@@ -222,6 +343,249 @@ async def update_status(
 
     return True
 
+
+async def set_no_reply(
+    pool: asyncpg.Pool,
+    contact_id: int,
+    admin_id: int | None = None,
+) -> bool:
+    """Move contact to no-reply and start 48-hour timer."""
+
+    contact = await get_contact(
+        pool,
+        contact_id,
+    )
+
+    if contact is None:
+        return False
+
+    old_status = contact["status"]
+
+    next_check = datetime.now().astimezone() + timedelta(
+        hours=48
+    )
+
+    await pool.execute(
+        """
+        UPDATE contacts
+        SET
+            status = $1,
+            last_contact_at = now(),
+            next_check_at = $2,
+            claimed_by = NULL,
+            claimed_at = NULL,
+            updated_at = now()
+        WHERE id = $3;
+        """,
+        STATUS_NO_REPLY,
+        next_check,
+        contact_id,
+    )
+
+    await pool.execute(
+        """
+        INSERT INTO actions (
+            contact_id,
+            admin_id,
+            action,
+            old_status,
+            new_status,
+            note
+        )
+        VALUES (
+            $1,
+            $2,
+            'no_reply_48h',
+            $3,
+            $4,
+            '48-hour timer started'
+        );
+        """,
+        contact_id,
+        admin_id,
+        old_status,
+        STATUS_NO_REPLY,
+    )
+
+    return True
+
+
+async def return_expired_no_reply(
+    pool: asyncpg.Pool,
+) -> int:
+    """Return expired no-reply contacts to the new queue."""
+
+    rows = await pool.fetch(
+        """
+        UPDATE contacts
+        SET
+            status = $1,
+            next_check_at = NULL,
+            last_contact_at = NULL,
+            claimed_by = NULL,
+            claimed_at = NULL,
+            updated_at = now()
+        WHERE status = $2
+          AND next_check_at IS NOT NULL
+          AND next_check_at <= now()
+        RETURNING id;
+        """,
+        STATUS_NEW,
+        STATUS_NO_REPLY,
+    )
+
+    for row in rows:
+        await pool.execute(
+            """
+            INSERT INTO actions (
+                contact_id,
+                admin_id,
+                action,
+                old_status,
+                new_status,
+                note
+            )
+            VALUES (
+                $1,
+                NULL,
+                'timer_expired',
+                $2,
+                $3,
+                '48-hour timer expired'
+            );
+            """,
+            row["id"],
+            STATUS_NO_REPLY,
+            STATUS_NEW,
+        )
+
+    return len(rows)
+
+
+# =========================
+# AGE
+# =========================
+
+async def set_age(
+    pool: asyncpg.Pool,
+    contact_id: int,
+    age: int,
+    admin_id: int | None = None,
+) -> bool:
+    """Save contact age."""
+
+    if age < 0 or age > 120:
+        return False
+
+    result = await pool.execute(
+        """
+        UPDATE contacts
+        SET
+            age = $1,
+            updated_at = now()
+        WHERE id = $2;
+        """,
+        age,
+        contact_id,
+    )
+
+    if result.endswith("1"):
+        await pool.execute(
+            """
+            INSERT INTO actions (
+                contact_id,
+                admin_id,
+                action,
+                note
+            )
+            VALUES (
+                $1,
+                $2,
+                'age_set',
+                $3
+            );
+            """,
+            contact_id,
+            admin_id,
+            f"Age: {age}",
+        )
+
+        return True
+
+    return False
+
+
+async def set_age_and_status(
+    pool: asyncpg.Pool,
+    contact_id: int,
+    age: int,
+    status: str,
+    admin_id: int | None = None,
+) -> bool:
+    """Save age and status together."""
+
+    if age < 0 or age > 120:
+        return False
+
+    contact = await get_contact(
+        pool,
+        contact_id,
+    )
+
+    if contact is None:
+        return False
+
+    old_status = contact["status"]
+
+    await pool.execute(
+        """
+        UPDATE contacts
+        SET
+            age = $1,
+            status = $2,
+            next_check_at = NULL,
+            claimed_by = NULL,
+            claimed_at = NULL,
+            updated_at = now()
+        WHERE id = $3;
+        """,
+        age,
+        status,
+        contact_id,
+    )
+
+    await pool.execute(
+        """
+        INSERT INTO actions (
+            contact_id,
+            admin_id,
+            action,
+            old_status,
+            new_status,
+            note
+        )
+        VALUES (
+            $1,
+            $2,
+            'age_and_status',
+            $3,
+            $4,
+            $5
+        );
+        """,
+        contact_id,
+        admin_id,
+        old_status,
+        status,
+        f"Age: {age}",
+    )
+
+    return True
+
+
+# =========================
+# CLAIM / RELEASE
+# =========================
 
 async def claim_contact(
     pool: asyncpg.Pool,
@@ -247,7 +611,27 @@ async def claim_contact(
         contact_id,
     )
 
-    return result.endswith("1")
+    if result.endswith("1"):
+        await pool.execute(
+            """
+            INSERT INTO actions (
+                contact_id,
+                admin_id,
+                action
+            )
+            VALUES (
+                $1,
+                $2,
+                'claimed'
+            );
+            """,
+            contact_id,
+            admin_id,
+        )
+
+        return True
+
+    return False
 
 
 async def release_contact(
@@ -271,8 +655,32 @@ async def release_contact(
         admin_id,
     )
 
-    return result.endswith("1")
+    if result.endswith("1"):
+        await pool.execute(
+            """
+            INSERT INTO actions (
+                contact_id,
+                admin_id,
+                action
+            )
+            VALUES (
+                $1,
+                $2,
+                'released'
+            );
+            """,
+            contact_id,
+            admin_id,
+        )
 
+        return True
+
+    return False
+
+
+# =========================
+# TIME / NOTES
+# =========================
 
 async def update_contact_time(
     pool: asyncpg.Pool,
@@ -319,7 +727,13 @@ async def add_note(
     return result.endswith("1")
 
 
-async def count_contacts(pool: asyncpg.Pool) -> int:
+# =========================
+# STATISTICS
+# =========================
+
+async def count_contacts(
+    pool: asyncpg.Pool,
+) -> int:
     """Return total number of contacts."""
 
     return int(
@@ -348,6 +762,12 @@ async def count_by_status(
             status,
         )
     )
+
+
+# =========================
+# OLD USERS TABLE
+# =========================
+
 async def upsert_user(
     pool: asyncpg.Pool,
     telegram_id: int,
@@ -380,8 +800,18 @@ async def upsert_user(
 
     return bool(result["is_new"])
 
-async def close_pool(pool: asyncpg.Pool) -> None:
+
+# =========================
+# CLOSE
+# =========================
+
+async def close_pool(
+    pool: asyncpg.Pool,
+) -> None:
     """Close PostgreSQL connection pool."""
 
     await pool.close()
-    logger.info("PostgreSQL pool closed.")
+
+    logger.info(
+        "PostgreSQL pool closed."
+    )
