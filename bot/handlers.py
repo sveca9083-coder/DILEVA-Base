@@ -31,6 +31,7 @@ STATUS_NO_REPLY = "no_reply"
 STATUS_REFUSED = "refused"
 STATUS_UNDER_16 = "under_16"
 STATUS_JOINED = "joined"
+STATUS_LEFT = "left"
 
 STATUS_NAMES = {
     STATUS_NEW: "🆕 Новые",
@@ -38,6 +39,7 @@ STATUS_NAMES = {
     STATUS_REFUSED: "🚫 Отказано",
     STATUS_UNDER_16: "🔞 Нету 16",
     STATUS_JOINED: "✅ Вступил",
+    STATUS_LEFT: "🚪 Вышел",
 }
 
 MENU_NEW = "🆕 Новые"
@@ -45,6 +47,7 @@ MENU_NO_REPLY = "⏳ Не отвечает"
 MENU_REFUSED = "🚫 Отказано"
 MENU_UNDER_16 = "🔞 Нету 16"
 MENU_JOINED = "✅ Вступил"
+MENU_LEFT = "🚪 Вышел"
 
 MENU_SEARCH = "🔎 Поиск"
 MENU_IMPORT = "📥 Импорт"
@@ -59,7 +62,7 @@ def get_menu_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
         [MENU_NEW, MENU_NO_REPLY],
         [MENU_REFUSED, MENU_UNDER_16],
-        [MENU_JOINED],
+        [MENU_JOINED, MENU_LEFT],
         [MENU_SEARCH, MENU_IMPORT],
         [MENU_STATS],
     ]
@@ -145,8 +148,6 @@ async def require_admin(update: Update) -> bool:
     if user is None:
         return False
 
-    # DILEVA Base panel works only in private messages.
-    # The bot must not reply to ordinary group members.
     if message is not None:
         if message.chat.type != "private":
             return False
@@ -205,7 +206,7 @@ async def start(
 
 
 # =========================
-# AUTOMATIC CHAT JOIN
+# AUTOMATIC CHAT MEMBER
 # =========================
 
 async def chat_member_update(
@@ -213,13 +214,17 @@ async def chat_member_update(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """
-    Automatically detect a new member joining a chat.
+    Automatically detect users joining or leaving a chat.
 
-    If the person already exists in contacts:
-        save Telegram ID and move to joined.
+    Join:
+        existing contact -> joined
+        new contact -> create -> joined
 
-    If the person does not exist:
-        create a new contact and move to joined.
+    Leave:
+        existing contact -> left
+
+    Rejoin:
+        left -> joined
 
     The bot does not send anything to the chat.
     """
@@ -238,18 +243,17 @@ async def chat_member_update(
         "creator",
     }
 
-    if new_status not in joined_statuses:
-        return
-
-    if old_status in joined_statuses:
-        return
+    left_statuses = {
+        "left",
+        "kicked",
+    }
 
     user = chat_member.new_chat_member.user
 
     if user is None:
         return
 
-    # Ignore bots joining the chat.
+    # Ignore bots.
     if user.is_bot:
         return
 
@@ -257,82 +261,158 @@ async def chat_member_update(
 
     if pool is None:
         logger.error(
-            "Chat join detected but database is unavailable."
+            "Chat member update detected but database is unavailable."
         )
         return
 
     try:
-        contact = await db.get_contact_by_telegram_id(
-            pool,
-            user.id,
-        )
 
-        if contact is None and user.username:
-            contact = await db.get_contact_by_username(
+        # =========================
+        # USER JOINED
+        # =========================
+
+        if new_status in joined_statuses:
+
+            # Already inside the chat.
+            # Ignore transitions such as member -> administrator.
+            if old_status in joined_statuses:
+                return
+
+            contact = await db.get_contact_by_telegram_id(
                 pool,
-                user.username,
+                user.id,
             )
 
-        # If there is no existing contact,
-        # create one automatically.
-        if contact is None:
+            if contact is None and user.username:
+                contact = await db.get_contact_by_username(
+                    pool,
+                    user.username,
+                )
 
-            if not user.username:
-                logger.info(
-                    "User %s joined without username. "
-                    "Cannot create username-based contact.",
+            # Create a new contact only when a username exists.
+            if contact is None:
+
+                if not user.username:
+                    logger.info(
+                        "User %s joined without username. "
+                        "Cannot create username-based contact.",
+                        user.id,
+                    )
+                    return
+
+                contact = await db.add_contact(
+                    pool,
+                    username=user.username,
+                    source="chat_join",
+                )
+
+            if contact is None:
+                logger.error(
+                    "Failed to create/find contact for user %s.",
                     user.id,
                 )
                 return
 
-            contact = await db.add_contact(
-                pool,
-                username=user.username,
-                source="chat_join",
-            )
-
-        if contact is None:
-            logger.error(
-                "Failed to create/find contact for user %s.",
-                user.id,
-            )
-            return
-
-        # Save Telegram information.
-        await db.update_telegram_user(
-            pool,
-            contact["id"],
-            telegram_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-        )
-
-        # Automatically move to joined.
-        await db.update_status(
-            pool,
-            contact["id"],
-            STATUS_JOINED,
-            admin_id=None,
-            note="Automatic chat join detection",
-        )
-
-        # Release temporary admin claim if there was one.
-        if contact["claimed_by"]:
-            await db.release_contact(
+            # Save Telegram information.
+            await db.update_telegram_user(
                 pool,
                 contact["id"],
-                contact["claimed_by"],
+                telegram_id=user.id,
+                username=user.username,
+                first_name=user.first_name,
             )
 
-        logger.info(
-            "User @%s (%s) automatically moved to joined.",
-            user.username,
-            user.id,
-        )
+            # Move automatically to joined.
+            await db.update_status(
+                pool,
+                contact["id"],
+                STATUS_JOINED,
+                admin_id=None,
+                note="Automatic chat join detection",
+            )
+
+            # Release temporary admin claim.
+            if contact["claimed_by"]:
+                await db.release_contact(
+                    pool,
+                    contact["id"],
+                    contact["claimed_by"],
+                )
+
+            logger.info(
+                "User @%s (%s) automatically moved to joined.",
+                user.username,
+                user.id,
+            )
+
+            return
+
+        # =========================
+        # USER LEFT
+        # =========================
+
+        if new_status in left_statuses:
+
+            # Ignore events where the user was already outside.
+            if old_status in left_statuses:
+                return
+
+            contact = await db.get_contact_by_telegram_id(
+                pool,
+                user.id,
+            )
+
+            if contact is None and user.username:
+                contact = await db.get_contact_by_username(
+                    pool,
+                    user.username,
+                )
+
+            # Do not create contacts on leave.
+            if contact is None:
+                logger.info(
+                    "User %s left the chat but was not found in contacts.",
+                    user.id,
+                )
+                return
+
+            # Save latest Telegram information.
+            await db.update_telegram_user(
+                pool,
+                contact["id"],
+                telegram_id=user.id,
+                username=user.username,
+                first_name=user.first_name,
+            )
+
+            # Move automatically to left.
+            await db.update_status(
+                pool,
+                contact["id"],
+                STATUS_LEFT,
+                admin_id=None,
+                note="Automatic chat leave detection",
+            )
+
+            # Release temporary admin claim.
+            if contact["claimed_by"]:
+                await db.release_contact(
+                    pool,
+                    contact["id"],
+                    contact["claimed_by"],
+                )
+
+            logger.info(
+                "User @%s (%s) automatically moved to left.",
+                user.username,
+                user.id,
+            )
+
+            return
 
     except Exception:
         logger.exception(
-            "Failed to process chat join for user %s.",
+            "Failed to process chat member update for user %s.",
             user.id,
         )
 
@@ -389,6 +469,13 @@ async def menu_button(
             update,
             context,
             STATUS_JOINED,
+        )
+
+    elif text == MENU_LEFT:
+        await show_status(
+            update,
+            context,
+            STATUS_LEFT,
         )
 
     elif text == MENU_SEARCH:
@@ -1006,6 +1093,11 @@ async def statistics(
             STATUS_JOINED,
         )
 
+        left_count = await db.count_by_status(
+            pool,
+            STATUS_LEFT,
+        )
+
     except Exception:
         logger.exception(
             "Statistics error."
@@ -1023,7 +1115,8 @@ async def statistics(
         f"⏳ Не отвечает: {no_reply_count}\n"
         f"🚫 Отказано: {refused_count}\n"
         f"🔞 Нету 16: {under_16_count}\n"
-        f"✅ Вступил: {joined_count}"
+        f"✅ Вступил: {joined_count}\n"
+        f"🚪 Вышел: {left_count}"
     )
 
 
@@ -1143,7 +1236,8 @@ def register_handlers(
         )
     )
 
-    # Automatic detection of users joining chats.
+    # Automatic detection of users
+    # joining or leaving chats.
     application.add_handler(
         ChatMemberHandler(
             chat_member_update,
@@ -1161,7 +1255,7 @@ def register_handlers(
     application.add_handler(
         MessageHandler(
             filters.Regex(
-                r"^(🆕 Новые|⏳ Не отвечает|🚫 Отказано|🔞 Нету 16|✅ Вступил|🔎 Поиск|📥 Импорт|📊 Статистика)$"
+                r"^(🆕 Новые|⏳ Не отвечает|🚫 Отказано|🔞 Нету 16|✅ Вступил|🚪 Вышел|🔎 Поиск|📥 Импорт|📊 Статистика)$"
             ),
             menu_button,
         )
