@@ -2,7 +2,6 @@
 
 import logging
 import os
-import re
 
 from telegram import (
     InlineKeyboardButton,
@@ -12,10 +11,11 @@ from telegram import (
 )
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
 )
 
@@ -52,7 +52,7 @@ MENU_STATS = "📊 Статистика"
 
 
 # =========================
-# KEYBOARD
+# KEYBOARDS
 # =========================
 
 def get_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -190,6 +190,128 @@ async def start(
 
 
 # =========================
+# AUTOMATIC CHAT JOIN
+# =========================
+
+async def chat_member_update(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Detect when a user joins a chat.
+
+    If the user already exists in contacts:
+        save Telegram ID and move to joined.
+
+    If the user is not in contacts:
+        create a new contact automatically
+        and set joined.
+    """
+
+    chat_member = update.chat_member
+
+    if chat_member is None:
+        return
+
+    old_status = chat_member.old_chat_member.status
+    new_status = chat_member.new_chat_member.status
+
+    # We only care about an actual transition into membership.
+    joined_statuses = {
+        "member",
+        "administrator",
+        "creator",
+    }
+
+    if new_status not in joined_statuses:
+        return
+
+    if old_status in joined_statuses:
+        return
+
+    user = chat_member.new_chat_member.user
+
+    if user is None or user.is_bot:
+        return
+
+    pool = context.bot_data.get(DB_KEY)
+
+    if pool is None:
+        logger.error(
+            "Chat join detected but database is unavailable."
+        )
+        return
+
+    try:
+        contact = await db.get_contact_by_telegram_id(
+            pool,
+            user.id,
+        )
+
+        if contact is None and user.username:
+            contact = await db.get_contact_by_username(
+                pool,
+                user.username,
+            )
+
+        if contact is None:
+            if not user.username:
+                logger.info(
+                    "User %s joined without username; "
+                    "cannot create username-based contact.",
+                    user.id,
+                )
+                return
+
+            contact = await db.add_contact(
+                pool,
+                username=user.username,
+                source="chat_join",
+            )
+
+        if contact is None:
+            logger.error(
+                "Failed to create/find contact for user %s.",
+                user.id,
+            )
+            return
+
+        await db.update_telegram_user(
+            pool,
+            contact["id"],
+            telegram_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+        )
+
+        await db.update_status(
+            pool,
+            contact["id"],
+            STATUS_JOINED,
+            admin_id=None,
+            note="Automatic chat join detection",
+        )
+
+        await db.release_contact(
+            pool,
+            contact["id"],
+            contact["claimed_by"],
+        ) if contact["claimed_by"] else None
+
+        logger.info(
+            "User @%s (%s) automatically moved to joined.",
+            user.username,
+            user.id,
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to process chat join for user %s.",
+            user.id,
+        )
+
+
+# =========================
 # MENU
 # =========================
 
@@ -209,57 +331,28 @@ async def menu_button(
     text = message.text.strip()
 
     if text == MENU_NEW:
-        await show_status(
-            update,
-            context,
-            STATUS_NEW,
-        )
+        await show_status(update, context, STATUS_NEW)
 
     elif text == MENU_NO_REPLY:
-        await show_status(
-            update,
-            context,
-            STATUS_NO_REPLY,
-        )
+        await show_status(update, context, STATUS_NO_REPLY)
 
     elif text == MENU_REFUSED:
-        await show_status(
-            update,
-            context,
-            STATUS_REFUSED,
-        )
+        await show_status(update, context, STATUS_REFUSED)
 
     elif text == MENU_UNDER_16:
-        await show_status(
-            update,
-            context,
-            STATUS_UNDER_16,
-        )
+        await show_status(update, context, STATUS_UNDER_16)
 
     elif text == MENU_JOINED:
-        await show_status(
-            update,
-            context,
-            STATUS_JOINED,
-        )
+        await show_status(update, context, STATUS_JOINED)
 
     elif text == MENU_SEARCH:
-        await search_start(
-            update,
-            context,
-        )
+        await search_start(update, context)
 
     elif text == MENU_IMPORT:
-        await import_start(
-            update,
-            context,
-        )
+        await import_start(update, context)
 
     elif text == MENU_STATS:
-        await statistics(
-            update,
-            context,
-        )
+        await statistics(update, context)
 
 
 # =========================
@@ -317,13 +410,11 @@ async def show_status(
 
     await message.reply_text(
         f"{title}\n\n"
-        "Нажми на username ниже:",
+        "Контакты:"
     )
 
     for contact in contacts:
-        username = contact["username"]
-
-        text = f"👤 @{username}"
+        text = f"👤 @{contact['username']}"
 
         if contact["age"] is not None:
             text += (
@@ -359,8 +450,6 @@ async def contact_callback(
     if query is None:
         return
 
-    await query.answer()
-
     user = query.from_user
 
     if user.id not in get_admin_ids():
@@ -369,6 +458,8 @@ async def contact_callback(
             show_alert=True,
         )
         return
+
+    await query.answer()
 
     pool = context.bot_data.get(DB_KEY)
 
@@ -386,7 +477,6 @@ async def contact_callback(
             ":",
             1,
         )
-
         contact_id = int(contact_id_raw)
 
     except (ValueError, AttributeError):
@@ -409,6 +499,7 @@ async def contact_callback(
         return
 
     if action == "claim":
+
         if contact["claimed_by"] not in (
             None,
             user.id,
@@ -430,11 +521,6 @@ async def contact_callback(
                 "🔒 Контакт закреплён за тобой."
             )
 
-            await query.edit_message_reply_markup(
-                reply_markup=contact_keyboard(
-                    contact_id
-                )
-            )
         else:
             await query.answer(
                 "🔒 Его уже забрал другой админ.",
@@ -443,16 +529,17 @@ async def contact_callback(
 
         return
 
+    if contact["claimed_by"] not in (
+        None,
+        user.id,
+    ):
+        await query.answer(
+            "🔒 Этот контакт обрабатывает другой админ.",
+            show_alert=True,
+        )
+        return
+
     if action == "no_reply":
-        if (
-            contact["claimed_by"] is not None
-            and contact["claimed_by"] != user.id
-        ):
-            await query.answer(
-                "🔒 Этот контакт обрабатывает другой админ.",
-                show_alert=True,
-            )
-            return
 
         await db.set_no_reply(
             pool,
@@ -460,29 +547,15 @@ async def contact_callback(
             user.id,
         )
 
-        await query.answer(
-            "⏳ Не отвечает. Таймер 48 часов запущен."
-        )
-
         await query.edit_message_text(
             f"👤 @{contact['username']}\n\n"
             "📌 Статус: ⏳ Не отвечает\n"
-            "⏰ Через 48 часов контакт "
-            "вернётся в 🆕 Новые."
+            "⏰ Таймер 48 часов запущен."
         )
 
         return
 
     if action == "refused":
-        if (
-            contact["claimed_by"] is not None
-            and contact["claimed_by"] != user.id
-        ):
-            await query.answer(
-                "🔒 Этот контакт обрабатывает другой админ.",
-                show_alert=True,
-            )
-            return
 
         await db.update_status(
             pool,
@@ -497,10 +570,6 @@ async def contact_callback(
             user.id,
         )
 
-        await query.answer(
-            "🚫 Отправлено в «Отказано»."
-        )
-
         await query.edit_message_text(
             f"👤 @{contact['username']}\n\n"
             "📌 Статус: 🚫 Отказано"
@@ -509,37 +578,18 @@ async def contact_callback(
         return
 
     if action == "under16":
-        if (
-            contact["claimed_by"] is not None
-            and contact["claimed_by"] != user.id
-        ):
-            await query.answer(
-                "🔒 Этот контакт обрабатывает другой админ.",
-                show_alert=True,
-            )
-            return
 
         context.user_data["waiting_age"] = contact_id
 
         await query.message.reply_text(
-            f"🔞 Введи возраст для @{contact['username']}.\n\n"
+            f"🔞 Введи возраст для "
+            f"@{contact['username']}.\n\n"
             "Например: 15"
         )
-
-        await query.answer()
 
         return
 
     if action == "joined":
-        if (
-            contact["claimed_by"] is not None
-            and contact["claimed_by"] != user.id
-        ):
-            await query.answer(
-                "🔒 Этот контакт обрабатывает другой админ.",
-                show_alert=True,
-            )
-            return
 
         await db.update_status(
             pool,
@@ -552,10 +602,6 @@ async def contact_callback(
             pool,
             contact_id,
             user.id,
-        )
-
-        await query.answer(
-            "✅ Отправлено в «Вступил»."
         )
 
         await query.edit_message_text(
@@ -620,25 +666,34 @@ async def handle_age_input(
         return True
 
     if age < 16:
-        status = STATUS_UNDER_16
-        result_text = "🔞 Нету 16"
+        await db.set_age_and_status(
+            pool,
+            contact_id,
+            age,
+            STATUS_UNDER_16,
+            update.effective_user.id,
+        )
+
+        result = "🔞 Нету 16"
+
     else:
-        status = STATUS_NO_REPLY
-        result_text = "⏳ Не отвечает"
+        await db.set_age_and_status(
+            pool,
+            contact_id,
+            age,
+            STATUS_NO_REPLY,
+            update.effective_user.id,
+        )
 
-    await db.set_age_and_status(
-        pool,
-        contact_id,
-        age,
-        status,
-        update.effective_user.id,
-    )
-
-    if status == STATUS_NO_REPLY:
         await db.set_no_reply(
             pool,
             contact_id,
             update.effective_user.id,
+        )
+
+        result = (
+            "⏳ Не отвечает\n"
+            "⏰ Таймер 48 часов запущен."
         )
 
     context.user_data.pop(
@@ -649,12 +704,7 @@ async def handle_age_input(
     await message.reply_text(
         f"👤 @{contact['username']}\n\n"
         f"🎂 Возраст: {age}\n"
-        f"📌 Статус: {result_text}"
-        + (
-            "\n⏰ Таймер 48 часов запущен."
-            if status == STATUS_NO_REPLY
-            else ""
-        )
+        f"📌 Статус: {result}"
     )
 
     return True
@@ -697,13 +747,7 @@ async def search_user(
     message = update.effective_message
     pool = context.bot_data.get(DB_KEY)
 
-    if message is None:
-        return
-
-    if pool is None:
-        await message.reply_text(
-            "⚠️ База данных сейчас недоступна."
-        )
+    if message is None or pool is None:
         return
 
     username = message.text.strip()
@@ -1033,6 +1077,14 @@ def register_handlers(
         CommandHandler(
             "start",
             start,
+        )
+    )
+
+    # Automatic detection of users joining chats.
+    application.add_handler(
+        ChatMemberHandler(
+            chat_member_update,
+            ChatMemberHandler.CHAT_MEMBER,
         )
     )
 
