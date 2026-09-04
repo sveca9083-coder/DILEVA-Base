@@ -765,6 +765,102 @@ async def count_by_status(
     )
 
 
+async def get_admin_statistics(
+    pool: asyncpg.Pool,
+):
+    """
+    Return statistics for every admin who has performed actions.
+
+    Counts are based on unique contacts, so repeated actions
+    on the same contact are not counted multiple times.
+    """
+
+    return await pool.fetch(
+        """
+        SELECT
+            a.admin_id,
+
+            COALESCE(
+                u.username,
+                NULL
+            ) AS username,
+
+            COALESCE(
+                u.first_name,
+                NULL
+            ) AS first_name,
+
+            COUNT(
+                DISTINCT a.contact_id
+            ) FILTER (
+                WHERE a.action = 'claimed'
+            ) AS claimed_count,
+
+            COUNT(
+                DISTINCT a.contact_id
+            ) FILTER (
+                WHERE a.action = 'no_reply_48h'
+            ) AS no_reply_count,
+
+            COUNT(
+                DISTINCT a.contact_id
+            ) FILTER (
+                WHERE a.action = 'status_change'
+                  AND a.new_status = $1
+            ) AS refused_count,
+
+            COUNT(
+                DISTINCT a.contact_id
+            ) FILTER (
+                WHERE a.action = 'age_and_status'
+                  AND a.new_status = $2
+            ) AS under_16_count,
+
+            COUNT(
+                DISTINCT a.contact_id
+            ) FILTER (
+                WHERE a.action = 'status_change'
+                  AND a.new_status = $3
+            ) AS joined_count,
+
+            COUNT(
+                DISTINCT a.contact_id
+            ) FILTER (
+                WHERE (
+                    a.action = 'no_reply_48h'
+                )
+                OR (
+                    a.action = 'status_change'
+                    AND a.new_status IN ($1, $3)
+                )
+                OR (
+                    a.action = 'age_and_status'
+                    AND a.new_status = $2
+                )
+            ) AS processed_count
+
+        FROM actions a
+
+        LEFT JOIN users u
+            ON u.telegram_id = a.admin_id
+
+        WHERE a.admin_id IS NOT NULL
+
+        GROUP BY
+            a.admin_id,
+            u.username,
+            u.first_name
+
+        ORDER BY
+            processed_count DESC,
+            a.admin_id ASC;
+        """,
+        STATUS_REFUSED,
+        STATUS_UNDER_16,
+        STATUS_JOINED,
+    )
+
+
 # =========================
 # OLD USERS TABLE
 # =========================
