@@ -253,7 +253,6 @@ async def chat_member_update(
     if user is None:
         return
 
-    # Ignore bots.
     if user.is_bot:
         return
 
@@ -273,8 +272,6 @@ async def chat_member_update(
 
         if new_status in joined_statuses:
 
-            # Already inside the chat.
-            # Ignore transitions such as member -> administrator.
             if old_status in joined_statuses:
                 return
 
@@ -289,7 +286,6 @@ async def chat_member_update(
                     user.username,
                 )
 
-            # Create a new contact only when a username exists.
             if contact is None:
 
                 if not user.username:
@@ -313,7 +309,6 @@ async def chat_member_update(
                 )
                 return
 
-            # Save Telegram information.
             await db.update_telegram_user(
                 pool,
                 contact["id"],
@@ -322,7 +317,6 @@ async def chat_member_update(
                 first_name=user.first_name,
             )
 
-            # Move automatically to joined.
             await db.update_status(
                 pool,
                 contact["id"],
@@ -331,7 +325,6 @@ async def chat_member_update(
                 note="Automatic chat join detection",
             )
 
-            # Release temporary admin claim.
             if contact["claimed_by"]:
                 await db.release_contact(
                     pool,
@@ -353,7 +346,6 @@ async def chat_member_update(
 
         if new_status in left_statuses:
 
-            # Ignore events where the user was already outside.
             if old_status in left_statuses:
                 return
 
@@ -368,7 +360,6 @@ async def chat_member_update(
                     user.username,
                 )
 
-            # Do not create contacts on leave.
             if contact is None:
                 logger.info(
                     "User %s left the chat but was not found in contacts.",
@@ -376,7 +367,6 @@ async def chat_member_update(
                 )
                 return
 
-            # Save latest Telegram information.
             await db.update_telegram_user(
                 pool,
                 contact["id"],
@@ -385,7 +375,6 @@ async def chat_member_update(
                 first_name=user.first_name,
             )
 
-            # Move automatically to left.
             await db.update_status(
                 pool,
                 contact["id"],
@@ -394,7 +383,6 @@ async def chat_member_update(
                 note="Automatic chat leave detection",
             )
 
-            # Release temporary admin claim.
             if contact["claimed_by"]:
                 await db.release_contact(
                     pool,
@@ -1098,6 +1086,10 @@ async def statistics(
             STATUS_LEFT,
         )
 
+        admin_stats = await db.get_admin_statistics(
+            pool
+        )
+
     except Exception:
         logger.exception(
             "Statistics error."
@@ -1108,7 +1100,7 @@ async def statistics(
         )
         return
 
-    await message.reply_text(
+    text = (
         "📊 Статистика DILEVA Base\n\n"
         f"👥 Всего: {total}\n\n"
         f"🆕 Новые: {new_count}\n"
@@ -1117,6 +1109,55 @@ async def statistics(
         f"🔞 Нету 16: {under_16_count}\n"
         f"✅ Вступил: {joined_count}\n"
         f"🚪 Вышел: {left_count}"
+    )
+
+    if admin_stats:
+        text += "\n\n👮 Отчёт по админам\n"
+
+        for admin in admin_stats:
+
+            admin_id = admin["admin_id"]
+            username = admin["username"]
+            first_name = admin["first_name"]
+
+            if first_name and username:
+                admin_name = (
+                    f"{first_name} (@{username})"
+                )
+
+            elif username:
+                admin_name = f"@{username}"
+
+            elif first_name:
+                admin_name = first_name
+
+            else:
+                admin_name = f"ID {admin_id}"
+
+            text += (
+                f"\n👤 {admin_name}\n"
+                f"📊 Обработано: "
+                f"{admin['processed_count']}\n"
+                f"🔒 Взято в работу: "
+                f"{admin['claimed_count']}\n"
+                f"⏳ Не отвечает: "
+                f"{admin['no_reply_count']}\n"
+                f"🚫 Отказано: "
+                f"{admin['refused_count']}\n"
+                f"🔞 Нету 16: "
+                f"{admin['under_16_count']}\n"
+                f"✅ Вступил: "
+                f"{admin['joined_count']}\n"
+            )
+
+    else:
+        text += (
+            "\n\n👮 Отчёт по админам\n\n"
+            "Пока действий админов нет."
+        )
+
+    await message.reply_text(
+        text
     )
 
 
@@ -1236,8 +1277,6 @@ def register_handlers(
         )
     )
 
-    # Automatic detection of users
-    # joining or leaving chats.
     application.add_handler(
         ChatMemberHandler(
             chat_member_update,
