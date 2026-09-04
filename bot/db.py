@@ -49,7 +49,28 @@ CREATE TABLE IF NOT EXISTS contacts (
     last_seen TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
+ALTER_ACTIONS_TABLE = """
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS contact_id BIGINT;
 
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS admin_id BIGINT;
+
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS action TEXT;
+
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS old_status TEXT;
+
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS new_status TEXT;
+
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS note TEXT;
+
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+"""
 
 CREATE_ACTIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS actions (
@@ -130,6 +151,7 @@ async def create_pool(dsn: str) -> asyncpg.Pool:
         await conn.execute(CREATE_CONTACTS_TABLE)
         await conn.execute(ALTER_CONTACTS_TABLE)
         await conn.execute(CREATE_ACTIONS_TABLE)
+        await conn.execute(ALTER_ACTIONS_TABLE)
 
     logger.info("PostgreSQL pool ready.")
 
