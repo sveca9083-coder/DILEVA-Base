@@ -17,6 +17,7 @@ STATUS_REFUSED = "refused"
 STATUS_UNDER_16 = "under_16"
 STATUS_JOINED = "joined"
 STATUS_LEFT = "left"
+STATUS_NOT_WORKING = "not_working"
 
 
 CREATE_CONTACTS_TABLE = """
@@ -47,47 +48,6 @@ CREATE TABLE IF NOT EXISTS contacts (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-"""
-ALTER_ACTIONS_TABLE = """
-ALTER TABLE actions
-    ADD COLUMN IF NOT EXISTS contact_id BIGINT;
-
-ALTER TABLE actions
-    ADD COLUMN IF NOT EXISTS admin_id BIGINT;
-
-ALTER TABLE actions
-    ADD COLUMN IF NOT EXISTS action TEXT;
-
-ALTER TABLE actions
-    ADD COLUMN IF NOT EXISTS old_status TEXT;
-
-ALTER TABLE actions
-    ADD COLUMN IF NOT EXISTS new_status TEXT;
-
-ALTER TABLE actions
-    ADD COLUMN IF NOT EXISTS note TEXT;
-
-ALTER TABLE actions
-    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
-"""
-
-CREATE_ACTIONS_TABLE = """
-CREATE TABLE IF NOT EXISTS actions (
-    id BIGSERIAL PRIMARY KEY,
-
-    contact_id BIGINT NOT NULL,
-
-    admin_id BIGINT,
-
-    action TEXT NOT NULL,
-
-    old_status TEXT,
-    new_status TEXT,
-
-    note TEXT,
-
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
 
@@ -137,6 +97,50 @@ ALTER TABLE contacts
 """
 
 
+CREATE_ACTIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS actions (
+    id BIGSERIAL PRIMARY KEY,
+
+    contact_id BIGINT NOT NULL,
+
+    admin_id BIGINT,
+
+    action TEXT NOT NULL,
+
+    old_status TEXT,
+    new_status TEXT,
+
+    note TEXT,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+
+ALTER_ACTIONS_TABLE = """
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS contact_id BIGINT;
+
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS admin_id BIGINT;
+
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS action TEXT;
+
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS old_status TEXT;
+
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS new_status TEXT;
+
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS note TEXT;
+
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+"""
+
+
 async def create_pool(dsn: str) -> asyncpg.Pool:
     """Open PostgreSQL connection pool and initialize DILEVA tables."""
 
@@ -150,6 +154,7 @@ async def create_pool(dsn: str) -> asyncpg.Pool:
     async with pool.acquire() as conn:
         await conn.execute(CREATE_CONTACTS_TABLE)
         await conn.execute(ALTER_CONTACTS_TABLE)
+
         await conn.execute(CREATE_ACTIONS_TABLE)
         await conn.execute(ALTER_ACTIONS_TABLE)
 
@@ -485,6 +490,128 @@ async def return_expired_no_reply(
     return len(rows)
 
 
+async def set_not_working(
+    pool: asyncpg.Pool,
+    contact_id: int,
+    admin_id: int | None = None,
+    note: str | None = None,
+) -> bool:
+    """Move contact to the not-working status."""
+
+    contact = await get_contact(
+        pool,
+        contact_id,
+    )
+
+    if contact is None:
+        return False
+
+    old_status = contact["status"]
+
+    await pool.execute(
+        """
+        UPDATE contacts
+        SET
+            status = $1,
+            next_check_at = NULL,
+            claimed_by = NULL,
+            claimed_at = NULL,
+            updated_at = now()
+        WHERE id = $2;
+        """,
+        STATUS_NOT_WORKING,
+        contact_id,
+    )
+
+    await pool.execute(
+        """
+        INSERT INTO actions (
+            contact_id,
+            admin_id,
+            action,
+            old_status,
+            new_status,
+            note
+        )
+        VALUES (
+            $1,
+            $2,
+            'not_working',
+            $3,
+            $4,
+            $5
+        );
+        """,
+        contact_id,
+        admin_id,
+        old_status,
+        STATUS_NOT_WORKING,
+        note,
+    )
+
+    return True
+
+
+async def return_to_new(
+    pool: asyncpg.Pool,
+    contact_id: int,
+    admin_id: int | None = None,
+) -> bool:
+    """Return a contact to the new queue."""
+
+    contact = await get_contact(
+        pool,
+        contact_id,
+    )
+
+    if contact is None:
+        return False
+
+    old_status = contact["status"]
+
+    await pool.execute(
+        """
+        UPDATE contacts
+        SET
+            status = $1,
+            next_check_at = NULL,
+            claimed_by = NULL,
+            claimed_at = NULL,
+            updated_at = now()
+        WHERE id = $2;
+        """,
+        STATUS_NEW,
+        contact_id,
+    )
+
+    await pool.execute(
+        """
+        INSERT INTO actions (
+            contact_id,
+            admin_id,
+            action,
+            old_status,
+            new_status,
+            note
+        )
+        VALUES (
+            $1,
+            $2,
+            'returned_to_new',
+            $3,
+            $4,
+            'Returned to new queue'
+        );
+        """,
+        contact_id,
+        admin_id,
+        old_status,
+        STATUS_NEW,
+    )
+
+    return True
+
+
 # =========================
 # AGE
 # =========================
@@ -702,6 +829,50 @@ async def release_contact(
 
 
 # =========================
+# ADMIN DISPLAY NAME
+# =========================
+
+async def get_admin_display_name(
+    pool: asyncpg.Pool,
+    admin_id: int | None,
+) -> str:
+    """
+    Return a human-readable admin name.
+
+    Priority:
+    1. @username
+    2. first name
+    3. Telegram ID
+    """
+
+    if admin_id is None:
+        return "Неизвестный админ"
+
+    user = await pool.fetchrow(
+        """
+        SELECT
+            username,
+            first_name
+        FROM users
+        WHERE telegram_id = $1;
+        """,
+        admin_id,
+    )
+
+    if user:
+        username = user["username"]
+        first_name = user["first_name"]
+
+        if username:
+            return f"@{username}"
+
+        if first_name:
+            return first_name
+
+    return f"ID {admin_id}"
+
+
+# =========================
 # TIME / NOTES
 # =========================
 
@@ -789,16 +960,59 @@ async def count_by_status(
 
 async def get_admin_statistics(
     pool: asyncpg.Pool,
+    period: str = "all",
 ):
     """
-    Return statistics for every admin who has performed actions.
+    Return statistics for every admin.
 
-    Counts are based on unique contacts, so repeated actions
-    on the same contact are not counted multiple times.
+    Supported periods:
+    - today
+    - yesterday
+    - week
+    - all
+
+    Statistics are calculated from the actions table.
     """
 
-    return await pool.fetch(
+    if period == "today":
+        time_condition = """
+            AND a.created_at >= (
+                date_trunc(
+                    'day',
+                    now() AT TIME ZONE 'Europe/Kyiv'
+                ) AT TIME ZONE 'Europe/Kyiv'
+            )
+            AND a.created_at <= now()
         """
+
+    elif period == "yesterday":
+        time_condition = """
+            AND a.created_at >= (
+                (
+                    date_trunc(
+                        'day',
+                        now() AT TIME ZONE 'Europe/Kyiv'
+                    ) - INTERVAL '1 day'
+                ) AT TIME ZONE 'Europe/Kyiv'
+            )
+            AND a.created_at < (
+                date_trunc(
+                    'day',
+                    now() AT TIME ZONE 'Europe/Kyiv'
+                ) AT TIME ZONE 'Europe/Kyiv'
+            )
+        """
+
+    elif period == "week":
+        time_condition = """
+            AND a.created_at >= now() - INTERVAL '7 days'
+            AND a.created_at <= now()
+        """
+
+    else:
+        time_condition = ""
+
+    query = f"""
         SELECT
             a.admin_id,
 
@@ -848,17 +1062,23 @@ async def get_admin_statistics(
             COUNT(
                 DISTINCT a.contact_id
             ) FILTER (
-                WHERE (
+                WHERE a.action = 'not_working'
+            ) AS not_working_count,
+
+            COUNT(
+                DISTINCT a.contact_id
+            ) FILTER (
+                WHERE
                     a.action = 'no_reply_48h'
-                )
-                OR (
-                    a.action = 'status_change'
-                    AND a.new_status IN ($1, $3)
-                )
-                OR (
-                    a.action = 'age_and_status'
-                    AND a.new_status = $2
-                )
+                    OR (
+                        a.action = 'status_change'
+                        AND a.new_status IN ($1, $3)
+                    )
+                    OR (
+                        a.action = 'age_and_status'
+                        AND a.new_status = $2
+                    )
+                    OR a.action = 'not_working'
             ) AS processed_count
 
         FROM actions a
@@ -867,6 +1087,7 @@ async def get_admin_statistics(
             ON u.telegram_id = a.admin_id
 
         WHERE a.admin_id IS NOT NULL
+        {time_condition}
 
         GROUP BY
             a.admin_id,
@@ -876,7 +1097,10 @@ async def get_admin_statistics(
         ORDER BY
             processed_count DESC,
             a.admin_id ASC;
-        """,
+    """
+
+    return await pool.fetch(
+        query,
         STATUS_REFUSED,
         STATUS_UNDER_16,
         STATUS_JOINED,
