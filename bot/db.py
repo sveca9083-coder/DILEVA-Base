@@ -270,15 +270,27 @@ async def update_telegram_user(
         UPDATE contacts
         SET
             telegram_id = $1,
-            username = COALESCE($2, username),
+
+            username = COALESCE(
+                NULLIF($2, ''),
+                username
+            ),
+
             username_normalized = COALESCE(
                 LOWER(NULLIF($2, '')),
                 username_normalized
             ),
-            first_name = COALESCE($3, first_name),
+
+            first_name = COALESCE(
+                NULLIF($3, ''),
+                first_name
+            ),
+
             last_seen = now(),
             updated_at = now()
+
         WHERE id = $4
+
         RETURNING *;
         """,
         telegram_id,
@@ -306,6 +318,39 @@ async def get_contacts_by_status(
         status,
         limit,
     )
+
+
+# =========================
+# ADMIN NAME
+# =========================
+
+async def get_admin_display_name(
+    pool: asyncpg.Pool,
+    admin_id: int,
+) -> str:
+    """Return a readable admin name."""
+
+    user = await pool.fetchrow(
+        """
+        SELECT
+            username,
+            first_name
+        FROM users
+        WHERE telegram_id = $1
+        LIMIT 1;
+        """,
+        admin_id,
+    )
+
+    if user is not None:
+
+        if user["username"]:
+            return f"@{user['username']}"
+
+        if user["first_name"]:
+            return user["first_name"]
+
+    return f"ID {admin_id}"
 
 
 # =========================
@@ -490,13 +535,16 @@ async def return_expired_no_reply(
     return len(rows)
 
 
+# =========================
+# NOT WORKING
+# =========================
+
 async def set_not_working(
     pool: asyncpg.Pool,
     contact_id: int,
     admin_id: int | None = None,
-    note: str | None = None,
 ) -> bool:
-    """Move contact to the not-working status."""
+    """Move contact to the permanent not-working status."""
 
     contact = await get_contact(
         pool,
@@ -514,6 +562,7 @@ async def set_not_working(
         SET
             status = $1,
             next_check_at = NULL,
+            last_contact_at = NULL,
             claimed_by = NULL,
             claimed_at = NULL,
             updated_at = now()
@@ -536,17 +585,16 @@ async def set_not_working(
         VALUES (
             $1,
             $2,
-            'not_working',
+            'status_change',
             $3,
             $4,
-            $5
+            'Marked as not working'
         );
         """,
         contact_id,
         admin_id,
         old_status,
         STATUS_NOT_WORKING,
-        note,
     )
 
     return True
@@ -557,7 +605,7 @@ async def return_to_new(
     contact_id: int,
     admin_id: int | None = None,
 ) -> bool:
-    """Return a contact to the new queue."""
+    """Return a not-working contact to the new queue."""
 
     contact = await get_contact(
         pool,
@@ -575,6 +623,7 @@ async def return_to_new(
         SET
             status = $1,
             next_check_at = NULL,
+            last_contact_at = NULL,
             claimed_by = NULL,
             claimed_at = NULL,
             updated_at = now()
@@ -597,10 +646,10 @@ async def return_to_new(
         VALUES (
             $1,
             $2,
-            'returned_to_new',
+            'status_change',
             $3,
             $4,
-            'Returned to new queue'
+            'Returned from not working to new'
         );
         """,
         contact_id,
@@ -640,6 +689,7 @@ async def set_age(
     )
 
     if result.endswith("1"):
+
         await pool.execute(
             """
             INSERT INTO actions (
@@ -755,13 +805,16 @@ async def claim_contact(
           AND (
               claimed_by IS NULL
               OR claimed_by = $1
-          );
+          )
+          AND status <> $3;
         """,
         admin_id,
         contact_id,
+        STATUS_NOT_WORKING,
     )
 
     if result.endswith("1"):
+
         await pool.execute(
             """
             INSERT INTO actions (
@@ -806,6 +859,7 @@ async def release_contact(
     )
 
     if result.endswith("1"):
+
         await pool.execute(
             """
             INSERT INTO actions (
@@ -826,50 +880,6 @@ async def release_contact(
         return True
 
     return False
-
-
-# =========================
-# ADMIN DISPLAY NAME
-# =========================
-
-async def get_admin_display_name(
-    pool: asyncpg.Pool,
-    admin_id: int | None,
-) -> str:
-    """
-    Return a human-readable admin name.
-
-    Priority:
-    1. @username
-    2. first name
-    3. Telegram ID
-    """
-
-    if admin_id is None:
-        return "Неизвестный админ"
-
-    user = await pool.fetchrow(
-        """
-        SELECT
-            username,
-            first_name
-        FROM users
-        WHERE telegram_id = $1;
-        """,
-        admin_id,
-    )
-
-    if user:
-        username = user["username"]
-        first_name = user["first_name"]
-
-        if username:
-            return f"@{username}"
-
-        if first_name:
-            return first_name
-
-    return f"ID {admin_id}"
 
 
 # =========================
@@ -922,7 +932,7 @@ async def add_note(
 
 
 # =========================
-# STATISTICS
+# BASIC STATISTICS
 # =========================
 
 async def count_contacts(
@@ -958,6 +968,10 @@ async def count_by_status(
     )
 
 
+# =========================
+# ADMIN STATISTICS
+# =========================
+
 async def get_admin_statistics(
     pool: asyncpg.Pool,
     period: str = "all",
@@ -965,54 +979,86 @@ async def get_admin_statistics(
     """
     Return statistics for every admin.
 
-    Supported periods:
-    - today
-    - yesterday
-    - week
-    - all
+    Periods:
+        today
+        yesterday
+        week
+        all
 
-    Statistics are calculated from the actions table.
+    Statistics are calculated from the actions table,
+    so they update immediately after an action is recorded.
     """
 
+    now = datetime.now().astimezone()
+
     if period == "today":
-        time_condition = """
-            AND a.created_at >= (
-                date_trunc(
-                    'day',
-                    now() AT TIME ZONE 'Europe/Kyiv'
-                ) AT TIME ZONE 'Europe/Kyiv'
-            )
-            AND a.created_at <= now()
-        """
+
+        start_time = now.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+
+        end_time = start_time + timedelta(
+            days=1
+        )
 
     elif period == "yesterday":
-        time_condition = """
-            AND a.created_at >= (
-                (
-                    date_trunc(
-                        'day',
-                        now() AT TIME ZONE 'Europe/Kyiv'
-                    ) - INTERVAL '1 day'
-                ) AT TIME ZONE 'Europe/Kyiv'
-            )
-            AND a.created_at < (
-                date_trunc(
-                    'day',
-                    now() AT TIME ZONE 'Europe/Kyiv'
-                ) AT TIME ZONE 'Europe/Kyiv'
-            )
-        """
+
+        end_time = now.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+
+        start_time = end_time - timedelta(
+            days=1
+        )
 
     elif period == "week":
-        time_condition = """
-            AND a.created_at >= now() - INTERVAL '7 days'
-            AND a.created_at <= now()
-        """
+
+        end_time = now
+
+        start_time = now - timedelta(
+            days=7
+        )
 
     else:
+
+        start_time = None
+        end_time = None
+
+    if start_time is None:
+
         time_condition = ""
 
-    query = f"""
+        params = [
+            STATUS_REFUSED,
+            STATUS_UNDER_16,
+            STATUS_JOINED,
+            STATUS_NOT_WORKING,
+        ]
+
+    else:
+
+        time_condition = """
+            AND a.created_at >= $5
+            AND a.created_at < $6
+        """
+
+        params = [
+            STATUS_REFUSED,
+            STATUS_UNDER_16,
+            STATUS_JOINED,
+            STATUS_NOT_WORKING,
+            start_time,
+            end_time,
+        ]
+
+    return await pool.fetch(
+        f"""
         SELECT
             a.admin_id,
 
@@ -1062,7 +1108,8 @@ async def get_admin_statistics(
             COUNT(
                 DISTINCT a.contact_id
             ) FILTER (
-                WHERE a.action = 'not_working'
+                WHERE a.action = 'status_change'
+                  AND a.new_status = $4
             ) AS not_working_count,
 
             COUNT(
@@ -1070,15 +1117,20 @@ async def get_admin_statistics(
             ) FILTER (
                 WHERE
                     a.action = 'no_reply_48h'
+
                     OR (
                         a.action = 'status_change'
-                        AND a.new_status IN ($1, $3)
+                        AND a.new_status IN (
+                            $1,
+                            $3,
+                            $4
+                        )
                     )
+
                     OR (
                         a.action = 'age_and_status'
                         AND a.new_status = $2
                     )
-                    OR a.action = 'not_working'
             ) AS processed_count
 
         FROM actions a
@@ -1097,13 +1149,8 @@ async def get_admin_statistics(
         ORDER BY
             processed_count DESC,
             a.admin_id ASC;
-    """
-
-    return await pool.fetch(
-        query,
-        STATUS_REFUSED,
-        STATUS_UNDER_16,
-        STATUS_JOINED,
+        """,
+        *params,
     )
 
 
