@@ -32,6 +32,7 @@ STATUS_REFUSED = "refused"
 STATUS_UNDER_16 = "under_16"
 STATUS_JOINED = "joined"
 STATUS_LEFT = "left"
+STATUS_NOT_WORKING = "not_working"
 
 STATUS_NAMES = {
     STATUS_NEW: "🆕 Новые",
@@ -40,6 +41,7 @@ STATUS_NAMES = {
     STATUS_UNDER_16: "🔞 Нету 16",
     STATUS_JOINED: "✅ Вступил",
     STATUS_LEFT: "🚪 Вышел",
+    STATUS_NOT_WORKING: "⛔ Не рабочие",
 }
 
 MENU_NEW = "🆕 Новые"
@@ -48,6 +50,7 @@ MENU_REFUSED = "🚫 Отказано"
 MENU_UNDER_16 = "🔞 Нету 16"
 MENU_JOINED = "✅ Вступил"
 MENU_LEFT = "🚪 Вышел"
+MENU_NOT_WORKING = "⛔ Не рабочие"
 
 MENU_SEARCH = "🔎 Поиск"
 MENU_IMPORT = "📥 Импорт"
@@ -63,6 +66,7 @@ def get_menu_keyboard() -> ReplyKeyboardMarkup:
         [MENU_NEW, MENU_NO_REPLY],
         [MENU_REFUSED, MENU_UNDER_16],
         [MENU_JOINED, MENU_LEFT],
+        [MENU_NOT_WORKING],
         [MENU_SEARCH, MENU_IMPORT],
         [MENU_STATS],
     ]
@@ -75,37 +79,55 @@ def get_menu_keyboard() -> ReplyKeyboardMarkup:
 
 def contact_keyboard(
     contact_id: int,
+    status: str = STATUS_NEW,
 ) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+
+    rows = [
         [
+            InlineKeyboardButton(
+                "🔒 Взять в работу",
+                callback_data=f"claim:{contact_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⏳ Не отвечает",
+                callback_data=f"no_reply:{contact_id}",
+            ),
+            InlineKeyboardButton(
+                "🚫 Отказ",
+                callback_data=f"refused:{contact_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🔞 Нету 16",
+                callback_data=f"under16:{contact_id}",
+            ),
+            InlineKeyboardButton(
+                "✅ Вступил",
+                callback_data=f"joined:{contact_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "⛔ Не рабочий",
+                callback_data=f"not_working:{contact_id}",
+            )
+        ],
+    ]
+
+    if status == STATUS_NOT_WORKING:
+        rows = [
             [
                 InlineKeyboardButton(
-                    "🔒 Взять в работу",
-                    callback_data=f"claim:{contact_id}",
+                    "♻️ Вернуть в новые",
+                    callback_data=f"return_new:{contact_id}",
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⏳ Не отвечает",
-                    callback_data=f"no_reply:{contact_id}",
-                ),
-                InlineKeyboardButton(
-                    "🚫 Отказ",
-                    callback_data=f"refused:{contact_id}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "🔞 Нету 16",
-                    callback_data=f"under16:{contact_id}",
-                ),
-                InlineKeyboardButton(
-                    "✅ Вступил",
-                    callback_data=f"joined:{contact_id}",
-                ),
-            ],
+            ]
         ]
-    )
+
+    return InlineKeyboardMarkup(rows)
 
 
 # =========================
@@ -213,21 +235,6 @@ async def chat_member_update(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """
-    Automatically detect users joining or leaving a chat.
-
-    Join:
-        existing contact -> joined
-        new contact -> create -> joined
-
-    Leave:
-        existing contact -> left
-
-    Rejoin:
-        left -> joined
-
-    The bot does not send anything to the chat.
-    """
 
     chat_member = update.chat_member
 
@@ -290,8 +297,7 @@ async def chat_member_update(
 
                 if not user.username:
                     logger.info(
-                        "User %s joined without username. "
-                        "Cannot create username-based contact.",
+                        "User %s joined without username.",
                         user.id,
                     )
                     return
@@ -362,7 +368,7 @@ async def chat_member_update(
 
             if contact is None:
                 logger.info(
-                    "User %s left the chat but was not found in contacts.",
+                    "User %s left but was not found.",
                     user.id,
                 )
                 return
@@ -425,64 +431,34 @@ async def menu_button(
     text = message.text.strip()
 
     if text == MENU_NEW:
-        await show_status(
-            update,
-            context,
-            STATUS_NEW,
-        )
+        await show_status(update, context, STATUS_NEW)
 
     elif text == MENU_NO_REPLY:
-        await show_status(
-            update,
-            context,
-            STATUS_NO_REPLY,
-        )
+        await show_status(update, context, STATUS_NO_REPLY)
 
     elif text == MENU_REFUSED:
-        await show_status(
-            update,
-            context,
-            STATUS_REFUSED,
-        )
+        await show_status(update, context, STATUS_REFUSED)
 
     elif text == MENU_UNDER_16:
-        await show_status(
-            update,
-            context,
-            STATUS_UNDER_16,
-        )
+        await show_status(update, context, STATUS_UNDER_16)
 
     elif text == MENU_JOINED:
-        await show_status(
-            update,
-            context,
-            STATUS_JOINED,
-        )
+        await show_status(update, context, STATUS_JOINED)
 
     elif text == MENU_LEFT:
-        await show_status(
-            update,
-            context,
-            STATUS_LEFT,
-        )
+        await show_status(update, context, STATUS_LEFT)
+
+    elif text == MENU_NOT_WORKING:
+        await show_status(update, context, STATUS_NOT_WORKING)
 
     elif text == MENU_SEARCH:
-        await search_start(
-            update,
-            context,
-        )
+        await search_start(update, context)
 
     elif text == MENU_IMPORT:
-        await import_start(
-            update,
-            context,
-        )
+        await import_start(update, context)
 
     elif text == MENU_STATS:
-        await statistics(
-            update,
-            context,
-        )
+        await statistics(update, context)
 
 
 # =========================
@@ -555,15 +531,22 @@ async def show_status(
             )
 
         if contact["claimed_by"]:
+
+            admin_name = await db.get_admin_display_name(
+                pool,
+                contact["claimed_by"],
+            )
+
             text += (
-                "\n🔒 Занят админом ID "
-                f"{contact['claimed_by']}"
+                "\n🔒 Занят админом: "
+                f"{admin_name}"
             )
 
         await message.reply_text(
             text,
             reply_markup=contact_keyboard(
-                contact["id"]
+                contact["id"],
+                contact["status"],
             ),
         )
 
@@ -631,14 +614,30 @@ async def contact_callback(
         )
         return
 
+    # =========================
+    # CLAIM
+    # =========================
+
     if action == "claim":
+
+        if contact["status"] == STATUS_NOT_WORKING:
+            await query.answer(
+                "⛔ Этот контакт помечен как не рабочий.",
+                show_alert=True,
+            )
+            return
 
         if contact["claimed_by"] not in (
             None,
             user.id,
         ):
+            admin_name = await db.get_admin_display_name(
+                pool,
+                contact["claimed_by"],
+            )
+
             await query.answer(
-                "🔒 Этот человек уже обрабатывается другим админом.",
+                f"🔒 Уже занят: {admin_name}",
                 show_alert=True,
             )
             return
@@ -650,9 +649,15 @@ async def contact_callback(
         )
 
         if success:
-            await query.answer(
-                "🔒 Контакт закреплён за тобой."
+            admin_name = await db.get_admin_display_name(
+                pool,
+                user.id,
             )
+
+            await query.answer(
+                f"🔒 Закреплено за {admin_name}."
+            )
+
         else:
             await query.answer(
                 "🔒 Его уже забрал другой админ.",
@@ -661,15 +666,68 @@ async def contact_callback(
 
         return
 
+    # =========================
+    # RETURN TO NEW
+    # =========================
+
+    if action == "return_new":
+
+        if contact["status"] != STATUS_NOT_WORKING:
+            await query.answer(
+                "ℹ️ Контакт уже не в папке «Не рабочие».",
+                show_alert=True,
+            )
+            return
+
+        success = await db.return_to_new(
+            pool,
+            contact_id,
+            user.id,
+        )
+
+        if not success:
+            await query.answer(
+                "❌ Не удалось вернуть контакт.",
+                show_alert=True,
+            )
+            return
+
+        await query.edit_message_text(
+            f"👤 @{contact['username']}\n\n"
+            "📌 Статус: 🆕 Новые"
+        )
+
+        return
+
+    # =========================
+    # OTHER ACTIONS
+    # =========================
+
+    if contact["status"] == STATUS_NOT_WORKING:
+        await query.answer(
+            "⛔ Сначала верни контакт в «Новые».",
+            show_alert=True,
+        )
+        return
+
     if contact["claimed_by"] not in (
         None,
         user.id,
     ):
+        admin_name = await db.get_admin_display_name(
+            pool,
+            contact["claimed_by"],
+        )
+
         await query.answer(
-            "🔒 Этот контакт обрабатывает другой админ.",
+            f"🔒 Этот контакт обрабатывает {admin_name}.",
             show_alert=True,
         )
         return
+
+    # =========================
+    # NO REPLY
+    # =========================
 
     if action == "no_reply":
 
@@ -686,6 +744,10 @@ async def contact_callback(
         )
 
         return
+
+    # =========================
+    # REFUSED
+    # =========================
 
     if action == "refused":
 
@@ -709,6 +771,10 @@ async def contact_callback(
 
         return
 
+    # =========================
+    # UNDER 16
+    # =========================
+
     if action == "under16":
 
         context.user_data["waiting_age"] = contact_id
@@ -720,6 +786,10 @@ async def contact_callback(
         )
 
         return
+
+    # =========================
+    # JOINED
+    # =========================
 
     if action == "joined":
 
@@ -740,6 +810,27 @@ async def contact_callback(
             f"👤 @{contact['username']}\n\n"
             "📌 Статус: ✅ Вступил"
         )
+
+        return
+
+    # =========================
+    # NOT WORKING
+    # =========================
+
+    if action == "not_working":
+
+        await db.set_not_working(
+            pool,
+            contact_id,
+            user.id,
+        )
+
+        await query.edit_message_text(
+            f"👤 @{contact['username']}\n\n"
+            "📌 Статус: ⛔ Не рабочий"
+        )
+
+        return
 
 
 # =========================
@@ -816,12 +907,6 @@ async def handle_age_input(
             contact_id,
             age,
             STATUS_NO_REPLY,
-            update.effective_user.id,
-        )
-
-        await db.set_no_reply(
-            pool,
-            contact_id,
             update.effective_user.id,
         )
 
@@ -916,9 +1001,15 @@ async def search_user(
         )
 
     if contact["claimed_by"]:
+
+        admin_name = await db.get_admin_display_name(
+            pool,
+            contact["claimed_by"],
+        )
+
         text += (
-            "\n🔒 Админ ID: "
-            f"{contact['claimed_by']}"
+            "\n🔒 Занят админом: "
+            f"{admin_name}"
         )
 
     if contact["notes"]:
@@ -929,7 +1020,8 @@ async def search_user(
     await message.reply_text(
         text,
         reply_markup=contact_keyboard(
-            contact["id"]
+            contact["id"],
+            contact["status"],
         ),
     )
 
@@ -1038,6 +1130,152 @@ async def import_users(
 # STATISTICS
 # =========================
 
+def statistics_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📅 Сегодня",
+                    callback_data="stats:today",
+                ),
+                InlineKeyboardButton(
+                    "📆 Вчера",
+                    callback_data="stats:yesterday",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🗓 7 дней",
+                    callback_data="stats:week",
+                ),
+                InlineKeyboardButton(
+                    "📈 Всё время",
+                    callback_data="stats:all",
+                ),
+            ],
+        ]
+    )
+
+
+def period_name(period: str) -> str:
+    names = {
+        "today": "📅 Сегодня",
+        "yesterday": "📆 Вчера",
+        "week": "🗓 За 7 дней",
+        "all": "📈 За всё время",
+    }
+
+    return names.get(
+        period,
+        "📈 За всё время",
+    )
+
+
+async def build_statistics_text(
+    pool,
+    period: str = "all",
+) -> str:
+
+    total = await db.count_contacts(pool)
+
+    new_count = await db.count_by_status(
+        pool,
+        STATUS_NEW,
+    )
+
+    no_reply_count = await db.count_by_status(
+        pool,
+        STATUS_NO_REPLY,
+    )
+
+    refused_count = await db.count_by_status(
+        pool,
+        STATUS_REFUSED,
+    )
+
+    under_16_count = await db.count_by_status(
+        pool,
+        STATUS_UNDER_16,
+    )
+
+    joined_count = await db.count_by_status(
+        pool,
+        STATUS_JOINED,
+    )
+
+    left_count = await db.count_by_status(
+        pool,
+        STATUS_LEFT,
+    )
+
+    not_working_count = await db.count_by_status(
+        pool,
+        STATUS_NOT_WORKING,
+    )
+
+    admin_stats = await db.get_admin_statistics(
+        pool,
+        period=period,
+    )
+
+    text = (
+        "📊 Статистика DILEVA Base\n\n"
+        f"👥 Всего: {total}\n\n"
+        f"🆕 Новые: {new_count}\n"
+        f"⏳ Не отвечает: {no_reply_count}\n"
+        f"🚫 Отказано: {refused_count}\n"
+        f"🔞 Нету 16: {under_16_count}\n"
+        f"✅ Вступил: {joined_count}\n"
+        f"🚪 Вышел: {left_count}\n"
+        f"⛔ Не рабочие: {not_working_count}\n\n"
+        f"👮 Отчёт по админам — "
+        f"{period_name(period)}\n"
+    )
+
+    if admin_stats:
+
+        for admin in admin_stats:
+
+            admin_id = admin["admin_id"]
+            username = admin["username"]
+            first_name = admin["first_name"]
+
+            if username:
+                admin_name = f"@{username}"
+
+            elif first_name:
+                admin_name = first_name
+
+            else:
+                admin_name = f"ID {admin_id}"
+
+            text += (
+                f"\n👤 {admin_name}\n"
+                f"├─ 📊 Обработано: "
+                f"{admin['processed_count']}\n"
+                f"├─ 🔒 Взял в работу: "
+                f"{admin['claimed_count']}\n"
+                f"├─ ⏳ Не отвечает: "
+                f"{admin['no_reply_count']}\n"
+                f"├─ 🚫 Отказано: "
+                f"{admin['refused_count']}\n"
+                f"├─ 🔞 Нету 16: "
+                f"{admin['under_16_count']}\n"
+                f"├─ ⛔ Не рабочие: "
+                f"{admin['not_working_count']}\n"
+                f"└─ ✅ Вступил: "
+                f"{admin['joined_count']}\n"
+            )
+
+    else:
+        text += (
+            "\n\nПока действий админов "
+            "за этот период нет."
+        )
+
+    return text
+
+
 async def statistics(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1053,41 +1291,9 @@ async def statistics(
         return
 
     try:
-
-        total = await db.count_contacts(pool)
-
-        new_count = await db.count_by_status(
+        text = await build_statistics_text(
             pool,
-            STATUS_NEW,
-        )
-
-        no_reply_count = await db.count_by_status(
-            pool,
-            STATUS_NO_REPLY,
-        )
-
-        refused_count = await db.count_by_status(
-            pool,
-            STATUS_REFUSED,
-        )
-
-        under_16_count = await db.count_by_status(
-            pool,
-            STATUS_UNDER_16,
-        )
-
-        joined_count = await db.count_by_status(
-            pool,
-            STATUS_JOINED,
-        )
-
-        left_count = await db.count_by_status(
-            pool,
-            STATUS_LEFT,
-        )
-
-        admin_stats = await db.get_admin_statistics(
-            pool
+            period="all",
         )
 
     except Exception:
@@ -1100,65 +1306,86 @@ async def statistics(
         )
         return
 
-    text = (
-        "📊 Статистика DILEVA Base\n\n"
-        f"👥 Всего: {total}\n\n"
-        f"🆕 Новые: {new_count}\n"
-        f"⏳ Не отвечает: {no_reply_count}\n"
-        f"🚫 Отказано: {refused_count}\n"
-        f"🔞 Нету 16: {under_16_count}\n"
-        f"✅ Вступил: {joined_count}\n"
-        f"🚪 Вышел: {left_count}"
+    await message.reply_text(
+        text,
+        reply_markup=statistics_keyboard(),
     )
 
-    if admin_stats:
-        text += "\n\n👮 Отчёт по админам\n"
 
-        for admin in admin_stats:
+async def statistics_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
 
-            admin_id = admin["admin_id"]
-            username = admin["username"]
-            first_name = admin["first_name"]
+    query = update.callback_query
 
-            if first_name and username:
-                admin_name = (
-                    f"{first_name} (@{username})"
-                )
+    if query is None:
+        return
 
-            elif username:
-                admin_name = f"@{username}"
+    if query.from_user.id not in get_admin_ids():
+        await query.answer(
+            "⛔ Нет доступа.",
+            show_alert=True,
+        )
+        return
 
-            elif first_name:
-                admin_name = first_name
+    await query.answer()
 
-            else:
-                admin_name = f"ID {admin_id}"
+    pool = context.bot_data.get(DB_KEY)
 
-            text += (
-                f"\n👤 {admin_name}\n"
-                f"📊 Обработано: "
-                f"{admin['processed_count']}\n"
-                f"🔒 Взято в работу: "
-                f"{admin['claimed_count']}\n"
-                f"⏳ Не отвечает: "
-                f"{admin['no_reply_count']}\n"
-                f"🚫 Отказано: "
-                f"{admin['refused_count']}\n"
-                f"🔞 Нету 16: "
-                f"{admin['under_16_count']}\n"
-                f"✅ Вступил: "
-                f"{admin['joined_count']}\n"
-            )
+    if pool is None:
+        await query.answer(
+            "⚠️ База недоступна.",
+            show_alert=True,
+        )
+        return
 
-    else:
-        text += (
-            "\n\n👮 Отчёт по админам\n\n"
-            "Пока действий админов нет."
+    data = query.data or ""
+
+    try:
+        _, period = data.split(
+            ":",
+            1,
+        )
+    except ValueError:
+        await query.answer(
+            "❌ Некорректный период.",
+            show_alert=True,
+        )
+        return
+
+    if period not in {
+        "today",
+        "yesterday",
+        "week",
+        "all",
+    }:
+        await query.answer(
+            "❌ Неизвестный период.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        text = await build_statistics_text(
+            pool,
+            period=period,
         )
 
-    await message.reply_text(
-        text
-    )
+        await query.edit_message_text(
+            text,
+            reply_markup=statistics_keyboard(),
+        )
+
+    except Exception:
+        logger.exception(
+            "Statistics callback error."
+        )
+
+        await query.answer(
+            "❌ Не удалось обновить статистику.",
+            show_alert=True,
+        )
 
 
 # =========================
@@ -1286,15 +1513,22 @@ def register_handlers(
 
     application.add_handler(
         CallbackQueryHandler(
+            statistics_callback,
+            pattern=r"^stats:(today|yesterday|week|all)$",
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
             contact_callback,
-            pattern=r"^(claim|no_reply|refused|under16|joined):\d+$",
+            pattern=r"^(claim|no_reply|refused|under16|joined|not_working|return_new):\d+$",
         )
     )
 
     application.add_handler(
         MessageHandler(
             filters.Regex(
-                r"^(🆕 Новые|⏳ Не отвечает|🚫 Отказано|🔞 Нету 16|✅ Вступил|🚪 Вышел|🔎 Поиск|📥 Импорт|📊 Статистика)$"
+                r"^(🆕 Новые|⏳ Не отвечает|🚫 Отказано|🔞 Нету 16|✅ Вступил|🚪 Вышел|⛔ Не рабочие|🔎 Поиск|📥 Импорт|📊 Статистика)$"
             ),
             menu_button,
         )
