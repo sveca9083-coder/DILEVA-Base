@@ -23,28 +23,19 @@ STATUS_NOT_WORKING = "not_working"
 CREATE_CONTACTS_TABLE = """
 CREATE TABLE IF NOT EXISTS contacts (
     id BIGSERIAL PRIMARY KEY,
-
     username TEXT NOT NULL,
     username_normalized TEXT NOT NULL UNIQUE,
-
     telegram_id BIGINT UNIQUE,
     first_name TEXT,
-
     status TEXT NOT NULL DEFAULT 'new',
-
     age INTEGER,
-
     source TEXT,
     added_by BIGINT,
-
     claimed_by BIGINT,
     claimed_at TIMESTAMPTZ,
-
     notes TEXT,
-
     last_contact_at TIMESTAMPTZ,
     next_check_at TIMESTAMPTZ,
-
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -100,18 +91,13 @@ ALTER TABLE contacts
 CREATE_ACTIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS actions (
     id BIGSERIAL PRIMARY KEY,
-
     contact_id BIGINT NOT NULL,
-
+    telegram_id BIGINT,
     admin_id BIGINT,
-
     action TEXT NOT NULL,
-
     old_status TEXT,
     new_status TEXT,
-
     note TEXT,
-
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
@@ -120,6 +106,9 @@ CREATE TABLE IF NOT EXISTS actions (
 ALTER_ACTIONS_TABLE = """
 ALTER TABLE actions
     ADD COLUMN IF NOT EXISTS contact_id BIGINT;
+
+ALTER TABLE actions
+    ADD COLUMN IF NOT EXISTS telegram_id BIGINT;
 
 ALTER TABLE actions
     ADD COLUMN IF NOT EXISTS admin_id BIGINT;
@@ -138,6 +127,18 @@ ALTER TABLE actions
 
 ALTER TABLE actions
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE actions
+    ALTER COLUMN telegram_id DROP NOT NULL;
+
+ALTER TABLE actions
+    ALTER COLUMN contact_id DROP NOT NULL;
+
+ALTER TABLE actions
+    ALTER COLUMN admin_id DROP NOT NULL;
+
+ALTER TABLE actions
+    ALTER COLUMN action DROP NOT NULL;
 """
 
 
@@ -268,7 +269,9 @@ async def update_telegram_user(
     normalized_username = None
 
     if username:
-        normalized_username = username.strip().lstrip("@").lower()
+        normalized_username = (
+            username.strip().lstrip("@").lower()
+        )
 
     return await pool.fetchrow(
         """
@@ -280,7 +283,10 @@ async def update_telegram_user(
                 $3,
                 username_normalized
             ),
-            first_name = COALESCE($4, first_name),
+            first_name = COALESCE(
+                $4,
+                first_name
+            ),
             last_seen = now(),
             updated_at = now()
         WHERE id = $5
@@ -349,6 +355,53 @@ async def get_admin_display_name(
 
 
 # =========================
+# ACTION LOG
+# =========================
+
+async def _log_action(
+    pool: asyncpg.Pool,
+    contact_id: int,
+    admin_id: int | None,
+    action: str,
+    old_status: str | None = None,
+    new_status: str | None = None,
+    note: str | None = None,
+):
+    """Write an action to the actions table."""
+
+    await pool.execute(
+        """
+        INSERT INTO actions (
+            contact_id,
+            telegram_id,
+            admin_id,
+            action,
+            old_status,
+            new_status,
+            note,
+            created_at
+        )
+        VALUES (
+            $1,
+            NULL,
+            $2,
+            $3,
+            $4,
+            $5,
+            $6,
+            now()
+        );
+        """,
+        contact_id,
+        admin_id,
+        action,
+        old_status,
+        new_status,
+        note,
+    )
+
+
+# =========================
 # STATUS
 # =========================
 
@@ -371,43 +424,50 @@ async def update_status(
 
     old_status = contact["status"]
 
-    await pool.execute(
-        """
-        UPDATE contacts
-        SET
-            status = $1,
-            updated_at = now()
-        WHERE id = $2;
-        """,
-        new_status,
-        contact_id,
-    )
+    async with pool.acquire() as conn:
+        async with conn.transaction():
 
-    await pool.execute(
-        """
-        INSERT INTO actions (
-            contact_id,
-            admin_id,
-            action,
-            old_status,
-            new_status,
-            note
-        )
-        VALUES (
-            $1,
-            $2,
-            'status_change',
-            $3,
-            $4,
-            $5
-        );
-        """,
-        contact_id,
-        admin_id,
-        old_status,
-        new_status,
-        note,
-    )
+            await conn.execute(
+                """
+                UPDATE contacts
+                SET
+                    status = $1,
+                    updated_at = now()
+                WHERE id = $2;
+                """,
+                new_status,
+                contact_id,
+            )
+
+            await conn.execute(
+                """
+                INSERT INTO actions (
+                    contact_id,
+                    telegram_id,
+                    admin_id,
+                    action,
+                    old_status,
+                    new_status,
+                    note,
+                    created_at
+                )
+                VALUES (
+                    $1,
+                    NULL,
+                    $2,
+                    'status_change',
+                    $3,
+                    $4,
+                    $5,
+                    now()
+                );
+                """,
+                contact_id,
+                admin_id,
+                old_status,
+                new_status,
+                note,
+            )
 
     return True
 
@@ -429,51 +489,59 @@ async def set_no_reply(
 
     old_status = contact["status"]
 
-    next_check = datetime.now().astimezone() + timedelta(
-        hours=48
+    next_check = (
+        datetime.now().astimezone()
+        + timedelta(hours=48)
     )
 
-    await pool.execute(
-        """
-        UPDATE contacts
-        SET
-            status = $1,
-            last_contact_at = now(),
-            next_check_at = $2,
-            claimed_by = NULL,
-            claimed_at = NULL,
-            updated_at = now()
-        WHERE id = $3;
-        """,
-        STATUS_NO_REPLY,
-        next_check,
-        contact_id,
-    )
+    async with pool.acquire() as conn:
+        async with conn.transaction():
 
-    await pool.execute(
-        """
-        INSERT INTO actions (
-            contact_id,
-            admin_id,
-            action,
-            old_status,
-            new_status,
-            note
-        )
-        VALUES (
-            $1,
-            $2,
-            'no_reply_48h',
-            $3,
-            $4,
-            '48-hour timer started'
-        );
-        """,
-        contact_id,
-        admin_id,
-        old_status,
-        STATUS_NO_REPLY,
-    )
+            await conn.execute(
+                """
+                UPDATE contacts
+                SET
+                    status = $1,
+                    last_contact_at = now(),
+                    next_check_at = $2,
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    updated_at = now()
+                WHERE id = $3;
+                """,
+                STATUS_NO_REPLY,
+                next_check,
+                contact_id,
+            )
+
+            await conn.execute(
+                """
+                INSERT INTO actions (
+                    contact_id,
+                    telegram_id,
+                    admin_id,
+                    action,
+                    old_status,
+                    new_status,
+                    note,
+                    created_at
+                )
+                VALUES (
+                    $1,
+                    NULL,
+                    $2,
+                    'no_reply_48h',
+                    $3,
+                    $4,
+                    '48-hour timer started',
+                    now()
+                );
+                """,
+                contact_id,
+                admin_id,
+                old_status,
+                STATUS_NO_REPLY,
+            )
 
     return True
 
@@ -503,28 +571,14 @@ async def return_expired_no_reply(
     )
 
     for row in rows:
-        await pool.execute(
-            """
-            INSERT INTO actions (
-                contact_id,
-                admin_id,
-                action,
-                old_status,
-                new_status,
-                note
-            )
-            VALUES (
-                $1,
-                NULL,
-                'timer_expired',
-                $2,
-                $3,
-                '48-hour timer expired'
-            );
-            """,
+        await _log_action(
+            pool,
             row["id"],
+            None,
+            "timer_expired",
             STATUS_NO_REPLY,
             STATUS_NEW,
+            "48-hour timer expired",
         )
 
     return len(rows)
@@ -551,45 +605,52 @@ async def set_not_working(
 
     old_status = contact["status"]
 
-    await pool.execute(
-        """
-        UPDATE contacts
-        SET
-            status = $1,
-            claimed_by = NULL,
-            claimed_at = NULL,
-            next_check_at = NULL,
-            updated_at = now()
-        WHERE id = $2;
-        """,
-        STATUS_NOT_WORKING,
-        contact_id,
-    )
+    async with pool.acquire() as conn:
+        async with conn.transaction():
 
-    await pool.execute(
-        """
-        INSERT INTO actions (
-            contact_id,
-            admin_id,
-            action,
-            old_status,
-            new_status,
-            note
-        )
-        VALUES (
-            $1,
-            $2,
-            'status_change',
-            $3,
-            $4,
-            'Marked as not working'
-        );
-        """,
-        contact_id,
-        admin_id,
-        old_status,
-        STATUS_NOT_WORKING,
-    )
+            await conn.execute(
+                """
+                UPDATE contacts
+                SET
+                    status = $1,
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    next_check_at = NULL,
+                    updated_at = now()
+                WHERE id = $2;
+                """,
+                STATUS_NOT_WORKING,
+                contact_id,
+            )
+
+            await conn.execute(
+                """
+                INSERT INTO actions (
+                    contact_id,
+                    telegram_id,
+                    admin_id,
+                    action,
+                    old_status,
+                    new_status,
+                    note,
+                    created_at
+                )
+                VALUES (
+                    $1,
+                    NULL,
+                    $2,
+                    'status_change',
+                    $3,
+                    $4,
+                    'Marked as not working',
+                    now()
+                );
+                """,
+                contact_id,
+                admin_id,
+                old_status,
+                STATUS_NOT_WORKING,
+            )
 
     return True
 
@@ -614,45 +675,52 @@ async def return_to_new(
     if old_status != STATUS_NOT_WORKING:
         return False
 
-    await pool.execute(
-        """
-        UPDATE contacts
-        SET
-            status = $1,
-            claimed_by = NULL,
-            claimed_at = NULL,
-            next_check_at = NULL,
-            updated_at = now()
-        WHERE id = $2;
-        """,
-        STATUS_NEW,
-        contact_id,
-    )
+    async with pool.acquire() as conn:
+        async with conn.transaction():
 
-    await pool.execute(
-        """
-        INSERT INTO actions (
-            contact_id,
-            admin_id,
-            action,
-            old_status,
-            new_status,
-            note
-        )
-        VALUES (
-            $1,
-            $2,
-            'status_change',
-            $3,
-            $4,
-            'Returned to new queue'
-        );
-        """,
-        contact_id,
-        admin_id,
-        old_status,
-        STATUS_NEW,
-    )
+            await conn.execute(
+                """
+                UPDATE contacts
+                SET
+                    status = $1,
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    next_check_at = NULL,
+                    updated_at = now()
+                WHERE id = $2;
+                """,
+                STATUS_NEW,
+                contact_id,
+            )
+
+            await conn.execute(
+                """
+                INSERT INTO actions (
+                    contact_id,
+                    telegram_id,
+                    admin_id,
+                    action,
+                    old_status,
+                    new_status,
+                    note,
+                    created_at
+                )
+                VALUES (
+                    $1,
+                    NULL,
+                    $2,
+                    'status_change',
+                    $3,
+                    $4,
+                    'Returned to new queue',
+                    now()
+                );
+                """,
+                contact_id,
+                admin_id,
+                old_status,
+                STATUS_NEW,
+            )
 
     return True
 
@@ -685,24 +753,13 @@ async def set_age(
     )
 
     if result.endswith("1"):
-        await pool.execute(
-            """
-            INSERT INTO actions (
-                contact_id,
-                admin_id,
-                action,
-                note
-            )
-            VALUES (
-                $1,
-                $2,
-                'age_set',
-                $3
-            );
-            """,
+
+        await _log_action(
+            pool,
             contact_id,
             admin_id,
-            f"Age: {age}",
+            "age_set",
+            note=f"Age: {age}",
         )
 
         return True
@@ -735,58 +792,66 @@ async def set_age_and_status(
     next_check = None
 
     if status == STATUS_NO_REPLY:
-        next_check = datetime.now().astimezone() + timedelta(
-            hours=48
+        next_check = (
+            datetime.now().astimezone()
+            + timedelta(hours=48)
         )
 
-    await pool.execute(
-        """
-        UPDATE contacts
-        SET
-            age = $1,
-            status = $2,
-            next_check_at = $3,
-            last_contact_at = CASE
-                WHEN $2 = 'no_reply'
-                THEN now()
-                ELSE last_contact_at
-            END,
-            claimed_by = NULL,
-            claimed_at = NULL,
-            updated_at = now()
-        WHERE id = $4;
-        """,
-        age,
-        status,
-        next_check,
-        contact_id,
-    )
+    async with pool.acquire() as conn:
+        async with conn.transaction():
 
-    await pool.execute(
-        """
-        INSERT INTO actions (
-            contact_id,
-            admin_id,
-            action,
-            old_status,
-            new_status,
-            note
-        )
-        VALUES (
-            $1,
-            $2,
-            'age_and_status',
-            $3,
-            $4,
-            $5
-        );
-        """,
-        contact_id,
-        admin_id,
-        old_status,
-        status,
-        f"Age: {age}",
-    )
+            await conn.execute(
+                """
+                UPDATE contacts
+                SET
+                    age = $1,
+                    status = $2,
+                    next_check_at = $3,
+                    last_contact_at = CASE
+                        WHEN $2 = 'no_reply'
+                        THEN now()
+                        ELSE last_contact_at
+                    END,
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    updated_at = now()
+                WHERE id = $4;
+                """,
+                age,
+                status,
+                next_check,
+                contact_id,
+            )
+
+            await conn.execute(
+                """
+                INSERT INTO actions (
+                    contact_id,
+                    telegram_id,
+                    admin_id,
+                    action,
+                    old_status,
+                    new_status,
+                    note,
+                    created_at
+                )
+                VALUES (
+                    $1,
+                    NULL,
+                    $2,
+                    'age_and_status',
+                    $3,
+                    $4,
+                    $5,
+                    now()
+                );
+                """,
+                contact_id,
+                admin_id,
+                old_status,
+                status,
+                f"Age: {age}",
+            )
 
     return True
 
@@ -802,46 +867,53 @@ async def claim_contact(
 ) -> bool:
     """Temporarily assign a contact to an admin."""
 
-    result = await pool.execute(
-        """
-        UPDATE contacts
-        SET
-            claimed_by = $1,
-            claimed_at = now(),
-            updated_at = now()
-        WHERE id = $2
-          AND status != $3
-          AND (
-              claimed_by IS NULL
-              OR claimed_by = $1
-          );
-        """,
-        admin_id,
-        contact_id,
-        STATUS_NOT_WORKING,
-    )
+    async with pool.acquire() as conn:
+        async with conn.transaction():
 
-    if result.endswith("1"):
-        await pool.execute(
-            """
-            INSERT INTO actions (
+            result = await conn.execute(
+                """
+                UPDATE contacts
+                SET
+                    claimed_by = $1,
+                    claimed_at = now(),
+                    updated_at = now()
+                WHERE id = $2
+                  AND status != $3
+                  AND (
+                      claimed_by IS NULL
+                      OR claimed_by = $1
+                  );
+                """,
+                admin_id,
+                contact_id,
+                STATUS_NOT_WORKING,
+            )
+
+            if not result.endswith("1"):
+                return False
+
+            await conn.execute(
+                """
+                INSERT INTO actions (
+                    contact_id,
+                    telegram_id,
+                    admin_id,
+                    action,
+                    created_at
+                )
+                VALUES (
+                    $1,
+                    NULL,
+                    $2,
+                    'claimed',
+                    now()
+                );
+                """,
                 contact_id,
                 admin_id,
-                action
             )
-            VALUES (
-                $1,
-                $2,
-                'claimed'
-            );
-            """,
-            contact_id,
-            admin_id,
-        )
 
-        return True
-
-    return False
+    return True
 
 
 async def release_contact(
@@ -866,21 +938,12 @@ async def release_contact(
     )
 
     if result.endswith("1"):
-        await pool.execute(
-            """
-            INSERT INTO actions (
-                contact_id,
-                admin_id,
-                action
-            )
-            VALUES (
-                $1,
-                $2,
-                'released'
-            );
-            """,
+
+        await _log_action(
+            pool,
             contact_id,
             admin_id,
+            "released",
         )
 
         return True
@@ -978,17 +1041,10 @@ async def get_admin_statistics(
     pool: asyncpg.Pool,
     period: str = "all",
 ):
-    """
-    Return live statistics for every admin.
-
-    period:
-        today
-        yesterday
-        week
-        all
-    """
+    """Return live statistics for every admin."""
 
     if period == "today":
+
         date_filter = """
             AND a.created_at >= date_trunc(
                 'day',
@@ -997,11 +1053,13 @@ async def get_admin_statistics(
         """
 
     elif period == "yesterday":
+
         date_filter = """
             AND a.created_at >= date_trunc(
                 'day',
                 now()
             ) - interval '1 day'
+
             AND a.created_at < date_trunc(
                 'day',
                 now()
@@ -1009,20 +1067,25 @@ async def get_admin_statistics(
         """
 
     elif period == "week":
+
         date_filter = """
-            AND a.created_at >= now() - interval '7 days'
+            AND a.created_at >= now()
+            - interval '7 days'
         """
 
     else:
+
         date_filter = ""
 
     query = f"""
         SELECT
             a.admin_id,
 
-            MAX(u.username) AS username,
+            MAX(u.username)
+                AS username,
 
-            MAX(u.first_name) AS first_name,
+            MAX(u.first_name)
+                AS first_name,
 
             COUNT(
                 DISTINCT a.contact_id
@@ -1052,34 +1115,41 @@ async def get_admin_statistics(
             COUNT(
                 DISTINCT a.contact_id
             ) FILTER (
-                WHERE a.action = 'age_and_status'
-                  AND a.new_status = $2
+                WHERE (
+                    a.action = 'age_and_status'
+                    AND a.new_status = $2
+                )
+                OR (
+                    a.action = 'status_change'
+                    AND a.new_status = $2
+                )
             ) AS under_16_count,
 
             COUNT(
                 DISTINCT a.contact_id
             ) FILTER (
-                WHERE a.action = 'status_change'
-                  AND a.new_status = $3
+                WHERE
+                    a.action = 'status_change'
+                    AND a.new_status = $3
             ) AS joined_count,
 
             COUNT(
                 DISTINCT a.contact_id
             ) FILTER (
-                WHERE a.action = 'status_change'
-                  AND a.new_status = $4
+                WHERE
+                    a.action = 'status_change'
+                    AND a.new_status = $4
             ) AS not_working_count,
 
             COUNT(
                 DISTINCT a.contact_id
             ) FILTER (
-                WHERE
-                    a.action IN (
-                        'claimed',
-                        'no_reply_48h',
-                        'status_change',
-                        'age_and_status'
-                    )
+                WHERE a.action IN (
+                    'claimed',
+                    'no_reply_48h',
+                    'status_change',
+                    'age_and_status'
+                )
             ) AS processed_count
 
         FROM actions a
@@ -1087,10 +1157,13 @@ async def get_admin_statistics(
         LEFT JOIN users u
             ON u.telegram_id = a.admin_id
 
-        WHERE a.admin_id IS NOT NULL
+        WHERE
+            a.admin_id IS NOT NULL
+
         {date_filter}
 
-        GROUP BY a.admin_id
+        GROUP BY
+            a.admin_id
 
         ORDER BY
             processed_count DESC,
@@ -1107,7 +1180,7 @@ async def get_admin_statistics(
 
 
 # =========================
-# OLD USERS TABLE
+# USERS
 # =========================
 
 async def upsert_user(
@@ -1125,10 +1198,14 @@ async def upsert_user(
             username,
             first_name
         )
-        VALUES ($1, $2, $3)
+        VALUES (
+            $1,
+            $2,
+            $3
+        )
 
-        ON CONFLICT (telegram_id) DO UPDATE
-        SET
+        ON CONFLICT (telegram_id)
+        DO UPDATE SET
             username = EXCLUDED.username,
             first_name = EXCLUDED.first_name,
             last_seen = now()
@@ -1140,7 +1217,9 @@ async def upsert_user(
         first_name,
     )
 
-    return bool(result["is_new"])
+    return bool(
+        result["is_new"]
+    )
 
 
 # =========================
