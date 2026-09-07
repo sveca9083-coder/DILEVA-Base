@@ -20,10 +20,6 @@ STATUS_LEFT = "left"
 STATUS_NOT_WORKING = "not_working"
 
 
-# =========================
-# TABLES
-# =========================
-
 CREATE_CONTACTS_TABLE = """
 CREATE TABLE IF NOT EXISTS contacts (
     id BIGSERIAL PRIMARY KEY,
@@ -145,10 +141,6 @@ ALTER TABLE actions
 """
 
 
-# =========================
-# POOL
-# =========================
-
 async def create_pool(dsn: str) -> asyncpg.Pool:
     """Open PostgreSQL connection pool and initialize DILEVA tables."""
 
@@ -238,9 +230,6 @@ async def get_contact_by_username(
 
     username = username.strip().lstrip("@").lower()
 
-    if not username:
-        return None
-
     return await pool.fetchrow(
         """
         SELECT *
@@ -286,27 +275,15 @@ async def update_telegram_user(
         UPDATE contacts
         SET
             telegram_id = $1,
-
-            username = COALESCE(
-                NULLIF($2, ''),
-                username
-            ),
-
+            username = COALESCE(NULLIF($2, ''), username),
             username_normalized = COALESCE(
-                NULLIF($3, ''),
+                $3,
                 username_normalized
             ),
-
-            first_name = COALESCE(
-                NULLIF($4, ''),
-                first_name
-            ),
-
+            first_name = COALESCE($4, first_name),
             last_seen = now(),
             updated_at = now()
-
         WHERE id = $5
-
         RETURNING *;
         """,
         telegram_id,
@@ -338,34 +315,35 @@ async def get_contacts_by_status(
 
 
 # =========================
-# ADMIN NAME
+# ADMIN DISPLAY NAME
 # =========================
 
 async def get_admin_display_name(
     pool: asyncpg.Pool,
-    admin_id: int,
+    admin_id: int | None,
 ) -> str:
-    """Return readable admin name instead of Telegram ID."""
+    """Return a readable admin name."""
 
-    row = await pool.fetchrow(
+    if admin_id is None:
+        return "неизвестный админ"
+
+    user = await pool.fetchrow(
         """
-        SELECT
-            username,
-            first_name
+        SELECT username, first_name
         FROM users
-        WHERE telegram_id = $1
-        LIMIT 1;
+        WHERE telegram_id = $1;
         """,
         admin_id,
     )
 
-    if row is not None:
+    if user is None:
+        return f"ID {admin_id}"
 
-        if row["username"]:
-            return f"@{row['username']}"
+    if user["username"]:
+        return f"@{user['username']}"
 
-        if row["first_name"]:
-            return row["first_name"]
+    if user["first_name"]:
+        return user["first_name"]
 
     return f"ID {admin_id}"
 
@@ -451,9 +429,8 @@ async def set_no_reply(
 
     old_status = contact["status"]
 
-    next_check = (
-        datetime.now().astimezone()
-        + timedelta(hours=48)
+    next_check = datetime.now().astimezone() + timedelta(
+        hours=48
     )
 
     await pool.execute(
@@ -516,11 +493,9 @@ async def return_expired_no_reply(
             claimed_by = NULL,
             claimed_at = NULL,
             updated_at = now()
-
         WHERE status = $2
           AND next_check_at IS NOT NULL
           AND next_check_at <= now()
-
         RETURNING id;
         """,
         STATUS_NEW,
@@ -528,7 +503,6 @@ async def return_expired_no_reply(
     )
 
     for row in rows:
-
         await pool.execute(
             """
             INSERT INTO actions (
@@ -554,142 +528,6 @@ async def return_expired_no_reply(
         )
 
     return len(rows)
-
-
-# =========================
-# AGE
-# =========================
-
-async def set_age(
-    pool: asyncpg.Pool,
-    contact_id: int,
-    age: int,
-    admin_id: int | None = None,
-) -> bool:
-    """Save contact age."""
-
-    if age < 0 or age > 120:
-        return False
-
-    result = await pool.execute(
-        """
-        UPDATE contacts
-        SET
-            age = $1,
-            updated_at = now()
-        WHERE id = $2;
-        """,
-        age,
-        contact_id,
-    )
-
-    if not result.endswith("1"):
-        return False
-
-    await pool.execute(
-        """
-        INSERT INTO actions (
-            contact_id,
-            admin_id,
-            action,
-            note
-        )
-        VALUES (
-            $1,
-            $2,
-            'age_set',
-            $3
-        );
-        """,
-        contact_id,
-        admin_id,
-        f"Age: {age}",
-    )
-
-    return True
-
-
-async def set_age_and_status(
-    pool: asyncpg.Pool,
-    contact_id: int,
-    age: int,
-    status: str,
-    admin_id: int | None = None,
-) -> bool:
-    """Save age and status together."""
-
-    if age < 0 or age > 120:
-        return False
-
-    contact = await get_contact(
-        pool,
-        contact_id,
-    )
-
-    if contact is None:
-        return False
-
-    old_status = contact["status"]
-
-    next_check = None
-
-    if status == STATUS_NO_REPLY:
-        next_check = (
-            datetime.now().astimezone()
-            + timedelta(hours=48)
-        )
-
-    await pool.execute(
-        """
-        UPDATE contacts
-        SET
-            age = $1,
-            status = $2,
-            next_check_at = $3,
-            claimed_by = NULL,
-            claimed_at = NULL,
-            last_contact_at = CASE
-                WHEN $2 = $4 THEN now()
-                ELSE last_contact_at
-            END,
-            updated_at = now()
-
-        WHERE id = $5;
-        """,
-        age,
-        status,
-        next_check,
-        STATUS_NO_REPLY,
-        contact_id,
-    )
-
-    await pool.execute(
-        """
-        INSERT INTO actions (
-            contact_id,
-            admin_id,
-            action,
-            old_status,
-            new_status,
-            note
-        )
-        VALUES (
-            $1,
-            $2,
-            'age_and_status',
-            $3,
-            $4,
-            $5
-        );
-        """,
-        contact_id,
-        admin_id,
-        old_status,
-        status,
-        f"Age: {age}",
-    )
-
-    return True
 
 
 # =========================
@@ -741,7 +579,7 @@ async def set_not_working(
         VALUES (
             $1,
             $2,
-            'not_working',
+            'status_change',
             $3,
             $4,
             'Marked as not working'
@@ -761,7 +599,7 @@ async def return_to_new(
     contact_id: int,
     admin_id: int | None = None,
 ) -> bool:
-    """Return a not-working contact to the new queue."""
+    """Return a not-working contact to new."""
 
     contact = await get_contact(
         pool,
@@ -772,6 +610,9 @@ async def return_to_new(
         return False
 
     old_status = contact["status"]
+
+    if old_status != STATUS_NOT_WORKING:
+        return False
 
     await pool.execute(
         """
@@ -801,7 +642,7 @@ async def return_to_new(
         VALUES (
             $1,
             $2,
-            'return_new',
+            'status_change',
             $3,
             $4,
             'Returned to new queue'
@@ -811,6 +652,140 @@ async def return_to_new(
         admin_id,
         old_status,
         STATUS_NEW,
+    )
+
+    return True
+
+
+# =========================
+# AGE
+# =========================
+
+async def set_age(
+    pool: asyncpg.Pool,
+    contact_id: int,
+    age: int,
+    admin_id: int | None = None,
+) -> bool:
+    """Save contact age."""
+
+    if age < 0 or age > 120:
+        return False
+
+    result = await pool.execute(
+        """
+        UPDATE contacts
+        SET
+            age = $1,
+            updated_at = now()
+        WHERE id = $2;
+        """,
+        age,
+        contact_id,
+    )
+
+    if result.endswith("1"):
+        await pool.execute(
+            """
+            INSERT INTO actions (
+                contact_id,
+                admin_id,
+                action,
+                note
+            )
+            VALUES (
+                $1,
+                $2,
+                'age_set',
+                $3
+            );
+            """,
+            contact_id,
+            admin_id,
+            f"Age: {age}",
+        )
+
+        return True
+
+    return False
+
+
+async def set_age_and_status(
+    pool: asyncpg.Pool,
+    contact_id: int,
+    age: int,
+    status: str,
+    admin_id: int | None = None,
+) -> bool:
+    """Save age and status together."""
+
+    if age < 0 or age > 120:
+        return False
+
+    contact = await get_contact(
+        pool,
+        contact_id,
+    )
+
+    if contact is None:
+        return False
+
+    old_status = contact["status"]
+
+    next_check = None
+
+    if status == STATUS_NO_REPLY:
+        next_check = datetime.now().astimezone() + timedelta(
+            hours=48
+        )
+
+    await pool.execute(
+        """
+        UPDATE contacts
+        SET
+            age = $1,
+            status = $2,
+            next_check_at = $3,
+            last_contact_at = CASE
+                WHEN $2 = 'no_reply'
+                THEN now()
+                ELSE last_contact_at
+            END,
+            claimed_by = NULL,
+            claimed_at = NULL,
+            updated_at = now()
+        WHERE id = $4;
+        """,
+        age,
+        status,
+        next_check,
+        contact_id,
+    )
+
+    await pool.execute(
+        """
+        INSERT INTO actions (
+            contact_id,
+            admin_id,
+            action,
+            old_status,
+            new_status,
+            note
+        )
+        VALUES (
+            $1,
+            $2,
+            'age_and_status',
+            $3,
+            $4,
+            $5
+        );
+        """,
+        contact_id,
+        admin_id,
+        old_status,
+        status,
+        f"Age: {age}",
     )
 
     return True
@@ -834,13 +809,8 @@ async def claim_contact(
             claimed_by = $1,
             claimed_at = now(),
             updated_at = now()
-
         WHERE id = $2
-          AND status NOT IN (
-              $3,
-              $4,
-              $5
-          )
+          AND status != $3
           AND (
               claimed_by IS NULL
               OR claimed_by = $1
@@ -849,31 +819,29 @@ async def claim_contact(
         admin_id,
         contact_id,
         STATUS_NOT_WORKING,
-        STATUS_REFUSED,
-        STATUS_UNDER_16,
     )
 
-    if not result.endswith("1"):
-        return False
-
-    await pool.execute(
-        """
-        INSERT INTO actions (
+    if result.endswith("1"):
+        await pool.execute(
+            """
+            INSERT INTO actions (
+                contact_id,
+                admin_id,
+                action
+            )
+            VALUES (
+                $1,
+                $2,
+                'claimed'
+            );
+            """,
             contact_id,
             admin_id,
-            action
         )
-        VALUES (
-            $1,
-            $2,
-            'claimed'
-        );
-        """,
-        contact_id,
-        admin_id,
-    )
 
-    return True
+        return True
+
+    return False
 
 
 async def release_contact(
@@ -890,7 +858,6 @@ async def release_contact(
             claimed_by = NULL,
             claimed_at = NULL,
             updated_at = now()
-
         WHERE id = $1
           AND claimed_by = $2;
         """,
@@ -898,27 +865,27 @@ async def release_contact(
         admin_id,
     )
 
-    if not result.endswith("1"):
-        return False
-
-    await pool.execute(
-        """
-        INSERT INTO actions (
+    if result.endswith("1"):
+        await pool.execute(
+            """
+            INSERT INTO actions (
+                contact_id,
+                admin_id,
+                action
+            )
+            VALUES (
+                $1,
+                $2,
+                'released'
+            );
+            """,
             contact_id,
             admin_id,
-            action
         )
-        VALUES (
-            $1,
-            $2,
-            'released'
-        );
-        """,
-        contact_id,
-        admin_id,
-    )
 
-    return True
+        return True
+
+    return False
 
 
 # =========================
@@ -939,7 +906,6 @@ async def update_contact_time(
             last_contact_at = now(),
             next_check_at = $1,
             updated_at = now()
-
         WHERE id = $2;
         """,
         next_check_at,
@@ -962,7 +928,6 @@ async def add_note(
         SET
             notes = $1,
             updated_at = now()
-
         WHERE id = $2;
         """,
         note,
@@ -1014,7 +979,7 @@ async def get_admin_statistics(
     period: str = "all",
 ):
     """
-    Return live statistics for admins.
+    Return live statistics for every admin.
 
     period:
         today
@@ -1024,22 +989,19 @@ async def get_admin_statistics(
     """
 
     if period == "today":
-
-        period_condition = """
-            a.created_at >= date_trunc(
+        date_filter = """
+            AND a.created_at >= date_trunc(
                 'day',
                 now()
             )
         """
 
     elif period == "yesterday":
-
-        period_condition = """
-            a.created_at >= date_trunc(
+        date_filter = """
+            AND a.created_at >= date_trunc(
                 'day',
                 now()
             ) - interval '1 day'
-
             AND a.created_at < date_trunc(
                 'day',
                 now()
@@ -1047,28 +1009,20 @@ async def get_admin_statistics(
         """
 
     elif period == "week":
-
-        period_condition = """
-            a.created_at >= now() - interval '7 days'
+        date_filter = """
+            AND a.created_at >= now() - interval '7 days'
         """
 
     else:
-
-        period_condition = "TRUE"
+        date_filter = ""
 
     query = f"""
         SELECT
             a.admin_id,
 
-            COALESCE(
-                u.username,
-                NULL
-            ) AS username,
+            MAX(u.username) AS username,
 
-            COALESCE(
-                u.first_name,
-                NULL
-            ) AS first_name,
+            MAX(u.first_name) AS first_name,
 
             COUNT(
                 DISTINCT a.contact_id
@@ -1091,37 +1045,29 @@ async def get_admin_statistics(
                 )
                 OR (
                     a.action = 'age_and_status'
-                    AND a.new_status = $2
+                    AND a.new_status = $1
                 )
             ) AS refused_count,
 
             COUNT(
                 DISTINCT a.contact_id
             ) FILTER (
-                WHERE
-                    a.action = 'age_and_status'
-                    AND a.new_status = $2
+                WHERE a.action = 'age_and_status'
+                  AND a.new_status = $2
             ) AS under_16_count,
 
             COUNT(
                 DISTINCT a.contact_id
             ) FILTER (
-                WHERE
-                    a.action = 'status_change'
-                    AND a.new_status = $3
+                WHERE a.action = 'status_change'
+                  AND a.new_status = $3
             ) AS joined_count,
 
             COUNT(
                 DISTINCT a.contact_id
             ) FILTER (
-                WHERE
-                    (
-                        a.action = 'not_working'
-                    )
-                    OR (
-                        a.action = 'status_change'
-                        AND a.new_status = $4
-                    )
+                WHERE a.action = 'status_change'
+                  AND a.new_status = $4
             ) AS not_working_count,
 
             COUNT(
@@ -1131,19 +1077,8 @@ async def get_admin_statistics(
                     a.action IN (
                         'claimed',
                         'no_reply_48h',
-                        'not_working'
-                    )
-                    OR (
-                        a.action = 'status_change'
-                        AND a.new_status IN (
-                            $1,
-                            $3,
-                            $4
-                        )
-                    )
-                    OR (
-                        a.action = 'age_and_status'
-                        AND a.new_status = $2
+                        'status_change',
+                        'age_and_status'
                     )
             ) AS processed_count
 
@@ -1152,14 +1087,10 @@ async def get_admin_statistics(
         LEFT JOIN users u
             ON u.telegram_id = a.admin_id
 
-        WHERE
-            a.admin_id IS NOT NULL
-            AND {period_condition}
+        WHERE a.admin_id IS NOT NULL
+        {date_filter}
 
-        GROUP BY
-            a.admin_id,
-            u.username,
-            u.first_name
+        GROUP BY a.admin_id
 
         ORDER BY
             processed_count DESC,
@@ -1196,25 +1127,20 @@ async def upsert_user(
         )
         VALUES ($1, $2, $3)
 
-        ON CONFLICT (telegram_id)
-
-        DO UPDATE SET
+        ON CONFLICT (telegram_id) DO UPDATE
+        SET
             username = EXCLUDED.username,
             first_name = EXCLUDED.first_name,
             last_seen = now()
 
-        RETURNING (
-            xmax = 0
-        ) AS is_new;
+        RETURNING (xmax = 0) AS is_new;
         """,
         telegram_id,
         username,
         first_name,
     )
 
-    return bool(
-        result["is_new"]
-    )
+    return bool(result["is_new"])
 
 
 # =========================
